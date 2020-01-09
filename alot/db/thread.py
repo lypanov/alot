@@ -1,15 +1,13 @@
 # Copyright (C) 2011-2012  Patrick Totzke <patricktotzke@gmail.com>
 # This file is released under the GNU GPL, version 3 or a later revision.
 # For further details see the COPYING file
-from __future__ import absolute_import
-
 from datetime import datetime
 
 from .message import Message
-from ..settings import settings
+from ..settings.const import settings
 
 
-class Thread(object):
+class Thread:
     """
     A wrapper around a notmuch mailthread (:class:`notmuch.database.Thread`)
     that ensures persistence of the thread: It can be safely read multiple
@@ -86,7 +84,7 @@ class Thread(object):
         """
         tags = set(list(self._tags))
         if intersection:
-            for m in self.get_messages().iterkeys():
+            for m in self.get_messages().keys():
                 tags = tags.intersection(set(m.get_tags()))
         return tags
 
@@ -157,7 +155,7 @@ class Thread(object):
         if self._authors is None:
             # Sort messages with date first (by date ascending), and those
             # without a date last.
-            msgs = sorted(self.get_messages().iterkeys(),
+            msgs = sorted(self.get_messages().keys(),
                           key=lambda m: m.get_date() or datetime.max)
 
             orderby = settings.get('thread_authors_order_by')
@@ -176,14 +174,14 @@ class Thread(object):
 
         return self._authors
 
-    def get_authors_string(self, own_addrs=None, replace_own=None):
+    def get_authors_string(self, own_accts=None, replace_own=None):
         """
         returns a string of comma-separated authors
         Depending on settings, it will substitute "me" for author name if
         address is user's own.
 
-        :param own_addrs: list of own email addresses to replace
-        :type own_addrs: list of str
+        :param own_accts: list of own accounts to replace
+        :type own_accts: list of :class:`Account`
         :param replace_own: whether or not to actually do replacement
         :type replace_own: bool
         :rtype: str
@@ -191,12 +189,14 @@ class Thread(object):
         if replace_own is None:
             replace_own = settings.get('thread_authors_replace_me')
         if replace_own:
-            if own_addrs is None:
-                own_addrs = settings.get_addresses()
+            if own_accts is None:
+                own_accts = settings.get_accounts()
             authorslist = []
             for aname, aaddress in self.get_authors():
-                if aaddress in own_addrs:
-                    aname = settings.get('thread_authors_me')
+                for account in own_accts:
+                    if account.matches_address(aaddress):
+                        aname = settings.get('thread_authors_me')
+                        break
                 if not aname:
                     aname = aaddress
                 if aname not in authorslist:
@@ -231,7 +231,7 @@ class Thread(object):
         """
         if not self._messages:  # if not already cached
             query = self._dbman.query('thread:' + self._id)
-            thread = query.search_threads().next()
+            thread = next(query.search_threads())
 
             def accumulate(acc, msg):
                 M = Message(self._dbman, msg, thread=self)
@@ -257,7 +257,7 @@ class Thread(object):
         """
         mid = msg.get_message_id()
         msg_hash = self.get_messages()
-        for m in msg_hash.iterkeys():
+        for m in msg_hash.keys():
             if m.get_message_id() == mid:
                 return msg_hash[m]
         return None

@@ -13,13 +13,15 @@
 
     :type: string
 
-.. _realname:
+.. _alias-regexp:
 
-.. describe:: realname
+.. describe:: alias_regexp
 
-     used to format the (proposed) From-header in outgoing mails
+     a regex for catching further aliases (like + extensions).
 
     :type: string
+    :default: None
+
 
 .. _aliases:
 
@@ -31,14 +33,123 @@
     :default: ,
 
 
-.. _alias-regexp:
+.. _case-sensitive-username:
 
-.. describe:: alias_regexp
+.. describe:: case_sensitive_username
 
-     a regex for catching further aliases (like + extensions).
+     Whether the server treats the address as case-senstive or
+     case-insensitve (True for the former, False for the latter)
+
+     .. note:: The vast majority (if not all) SMTP servers in modern use
+               treat usernames as case insenstive, you should only set
+               this if you know that you need it.
+
+    :type: boolean
+    :default: False
+
+
+.. _draft-box:
+
+.. describe:: draft_box
+
+     where to store draft mails, e.g. `maildir:///home/you/mail/Drafts` or `maildir://~/mail/Drafts`.
+     You can use mbox, maildir, mh, babyl and mmdf in the protocol part of the URL.
+
+     .. note:: You will most likely want drafts indexed by notmuch to be able to
+               later access them within alot. This currently only works for
+               maildir containers in a path below your notmuch database path.
+
+    :type: mail_container
+    :default: None
+
+
+.. _draft-tags:
+
+.. describe:: draft_tags
+
+     list of tags to automatically add to draft messages
+
+    :type: string list
+    :default: draft
+
+
+.. _encrypt-by-default:
+
+.. describe:: encrypt_by_default
+
+     Alot will try to GPG encrypt outgoing messages by default when this
+     is set to `all` or `trusted`.  If set to `all` the message will be
+     encrypted for all recipients for who a key is available in the key
+     ring.  If set to `trusted` it will be encrypted to all
+     recipients if a trusted key is available for all recipients (one
+     where the user id for the key is signed with a trusted signature).
+
+     .. note:: If the message will not be encrypted by default you can
+               still use the :ref:`toggleencrypt
+               <cmd.envelope.toggleencrypt>`, :ref:`encrypt
+               <cmd.envelope.encrypt>` and :ref:`unencrypt
+               <cmd.envelope.unencrypt>` commands to encrypt it.
+     .. deprecated:: 0.4
+               The values `True` and `False` are interpreted as `all` and
+               `none` respectively. `0`, `1`, `true`, `True`, `false`,
+               `False`, `yes`, `Yes`, `no`, `No`, will be removed before
+               1.0, please move to `all`, `none`, or `trusted`.
+
+    :type: option, one of ['all', 'none', 'trusted', 'True', 'False', 'true', 'false', 'Yes', 'No', 'yes', 'no', '1', '0']
+    :default: none
+
+
+.. _encrypt-to-self:
+
+.. describe:: encrypt_to_self
+
+     If this is true when encrypting a message it will also be encrypted
+     with the key defined for this account.
+
+     .. warning::
+
+        Before 0.6 this was controlled via gpg.conf.
+
+    :type: boolean
+    :default: True
+
+
+.. _gpg-key:
+
+.. describe:: gpg_key
+
+     The GPG key ID you want to use with this account.
 
     :type: string
     :default: None
+
+
+.. _passed-tags:
+
+.. describe:: passed_tags
+
+     list of tags to automatically add to passed messages
+
+    :type: string list
+    :default: passed
+
+
+.. _realname:
+
+.. describe:: realname
+
+     used to format the (proposed) From-header in outgoing mails
+
+    :type: string
+
+.. _replied-tags:
+
+.. describe:: replied_tags
+
+     list of tags to automatically add to replied messages
+
+    :type: string list
+    :default: replied
 
 
 .. _sendmail-command:
@@ -55,26 +166,11 @@
 
 .. describe:: sent_box
 
-     where to store outgoing mails, e.g. `maildir:///home/you/mail/Sent`.
+     where to store outgoing mails, e.g. `maildir:///home/you/mail/Sent` or `maildir://~/mail/Sent`.
      You can use mbox, maildir, mh, babyl and mmdf in the protocol part of the URL.
 
      .. note:: If you want to add outgoing mails automatically to the notmuch index
                you must use maildir in a path within your notmuch database path.
-
-    :type: mail_container
-    :default: None
-
-
-.. _draft-box:
-
-.. describe:: draft_box
-
-     where to store draft mails, e.g. `maildir:///home/you/mail/Drafts`.
-     You can use mbox, maildir, mh, babyl and mmdf in the protocol part of the URL.
-
-     .. note:: You will most likely want drafts indexed by notmuch to be able to
-               later access them within alot. This currently only works for
-               maildir containers in a path below your notmuch database path.
 
     :type: mail_container
     :default: None
@@ -87,7 +183,17 @@
      list of tags to automatically add to outgoing messages
 
     :type: string list
-    :default: sent,
+    :default: sent
+
+
+.. _sign-by-default:
+
+.. describe:: sign_by_default
+
+     Outgoing messages will be GPG signed by default if this is set to True.
+
+    :type: boolean
+    :default: False
 
 
 .. _signature:
@@ -118,53 +224,6 @@
 
      signature file's name as it appears in outgoing mails if
      :ref:`signature_as_attachment <signature-as-attachment>` is set to True
-
-    :type: string
-    :default: None
-
-
-.. _sign-by-default:
-
-.. describe:: sign_by_default
-
-     Outgoing messages will be GPG signed by default if this is set to True.
-
-    :type: boolean
-    :default: False
-
-
-.. _encrypt-by-default:
-
-.. describe:: encrypt_by_default
-
-     Alot will try to GPG encrypt outgoing messages by default when this
-     is set to `all` or `trusted`.  If set to `all` the message will be
-     encrypted for all recipients for who a key is available in the key
-     ring.  If set to `trusted` it will be encrypted to all
-     recipients if a trusted key is available for all recipients (one
-     where the user id for the key is signed with a trusted signature).
-
-     .. note:: If the message will not be encrypted by default you can
-               still use the :ref:`toggleencrypt
-               <cmd.envelope.toggleencrypt>`, :ref:`encrypt
-               <cmd.envelope.encrypt>` and :ref:`unencrypt
-               <cmd.envelope.unencrypt>` commands to encrypt it.
-     .. note:: The values `True` and `False` are interpreted as `all` and
-               `none` respectively.  They are kept for backwards
-               compatibility to give users a change to migrate to the new
-               option type.  They might become deprecated in future
-               versions.
-
-    :type: option, one of ['all', 'none', 'trusted', 'True', 'False', 'true', 'false', 'Yes', 'No', 'yes', 'no', '1', '0']
-    :default: none
-
-
-.. _gpg-key:
-
-.. describe:: gpg_key
-
-     The GPG key ID you want to use with this account. If unset, alot will
-     use your default key.
 
     :type: string
     :default: None

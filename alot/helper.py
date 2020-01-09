@@ -1,14 +1,11 @@
 # -*- coding: utf-8 -*-
 # Copyright (C) 2011-2012  Patrick Totzke <patricktotzke@gmail.com>
+# Copyright © 2017-2018 Dylan Baker
 # This file is released under the GNU GPL, version 3 or a later revision.
 # For further details see the COPYING file
-from __future__ import absolute_import
-from __future__ import division
-
 from datetime import timedelta
 from datetime import datetime
 from collections import deque
-from cStringIO import StringIO
 import logging
 import mimetypes
 import os
@@ -16,18 +13,14 @@ import re
 import shlex
 import subprocess
 import email
-from email.generator import Generator
 from email.mime.audio import MIMEAudio
 from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
 from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import asyncio
 
 import urwid
 import magic
-from twisted.internet import reactor
-from twisted.internet.protocol import ProcessProtocol
-from twisted.internet.defer import Deferred
 
 
 def split_commandline(s, comments=False, posix=True):
@@ -38,9 +31,6 @@ def split_commandline(s, comments=False, posix=True):
     s = s.replace('\\', '\\\\')
     s = s.replace('\'', '\\\'')
     s = s.replace('\"', '\\\"')
-    # encode s to utf-8 for shlex
-    if isinstance(s, unicode):
-        s = s.encode('utf-8')
     lex = shlex.shlex(s, posix=posix)
     lex.whitespace_split = True
     lex.whitespace = ';'
@@ -55,8 +45,7 @@ def split_commandstring(cmdstring):
     and the like. This simply calls shlex.split but works also with unicode
     bytestrings.
     """
-    if isinstance(cmdstring, unicode):
-        cmdstring = cmdstring.encode('utf-8', errors='ignore')
+    assert isinstance(cmdstring, str)
     return shlex.split(cmdstring)
 
 
@@ -103,15 +92,23 @@ def string_sanitize(string, tab_width=8):
 def string_decode(string, enc='ascii'):
     """
     safely decodes string to unicode bytestring, respecting `enc` as a hint.
+
+    :param string: the string to decode
+    :type string: str or unicode
+    :param enc: a hint what encoding is used in string ('ascii', 'utf-8', ...)
+    :type enc: str
+    :returns: the unicode decoded input string
+    :rtype: unicode
+
     """
 
     if enc is None:
         enc = 'ascii'
     try:
-        string = unicode(string, enc, errors='replace')
+        string = str(string, enc, errors='replace')
     except LookupError:  # malformed enc string
         string = string.decode('ascii', errors='replace')
-    except TypeError:  # already unicode
+    except TypeError:  # already str
         pass
     return string
 
@@ -119,7 +116,7 @@ def string_decode(string, enc='ascii'):
 def shorten(string, maxlen):
     """shortens string if longer than maxlen, appending ellipsis"""
     if 1 < maxlen < len(string):
-        string = string[:maxlen - 1] + u'\u2026'
+        string = string[:maxlen - 1] + '…'
     return string[:maxlen]
 
 
@@ -165,7 +162,7 @@ def shorten_author_string(authors_string, maxlength):
     authors_chain = deque()
 
     if len(authors) == 0:
-        return u''
+        return ''
 
     # reserve space for first author
     first_au = shorten(authors.popleft(), maxlength)
@@ -182,7 +179,7 @@ def shorten_author_string(authors_string, maxlength):
         au = authors.pop()
         if len(au) > 1 and (remaining_length == 3 or (authors and
                                                       remaining_length < 7)):
-            authors_chain.appendleft(u'\u2026')
+            authors_chain.appendleft('…')
             break
         else:
             if authors:
@@ -208,21 +205,21 @@ def pretty_datetime(d):
     >>> now.strftime('%c')
     'Sat 31 Mar 2012 14:47:26 '
     >>> pretty_datetime(now)
-    u'just now'
+    'just now'
     >>> pretty_datetime(now - timedelta(minutes=1))
-    u'1min ago'
+    '1min ago'
     >>> pretty_datetime(now - timedelta(hours=5))
-    u'5h ago'
+    '5h ago'
     >>> pretty_datetime(now - timedelta(hours=12))
-    u'02:54am'
+    '02:54am'
     >>> pretty_datetime(now - timedelta(days=1))
-    u'yest 02pm'
+    'yest 02pm'
     >>> pretty_datetime(now - timedelta(days=2))
-    u'Thu 02pm'
+    'Thu 02pm'
     >>> pretty_datetime(now - timedelta(days=7))
-    u'Mar 24'
+    'Mar 24'
     >>> pretty_datetime(now - timedelta(days=356))
-    u'Apr 2011'
+    'Apr 2011'
     """
     ampm = d.strftime('%p').lower()
     if len(ampm):
@@ -268,79 +265,70 @@ def call_cmd(cmdlist, stdin=None):
                     by :meth:`subprocess.Popen`
     :type cmdlist: list of str
     :param stdin: string to pipe to the process
-    :type stdin: str
+    :type stdin: str, bytes, or None
     :return: triple of stdout, stderr, return value of the shell command
     :rtype: str, str, int
     """
-
-    out, err, ret = '', '', 0
+    termenc = urwid.util.detected_encoding
+    if isinstance(stdin, str):
+        stdin = stdin.encode(termenc)
     try:
-        if stdin:
-            proc = subprocess.Popen(cmdlist, stdin=subprocess.PIPE,
-                                    stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE)
-            out, err = proc.communicate(stdin)
-            ret = proc.poll()
-        else:
-            try:
-                out = subprocess.check_output(cmdlist)
-            except subprocess.CalledProcessError as e:
-                err = e.output
-                ret = e.returncode
+
+        logging.debug("Calling %s" % cmdlist)
+        proc = subprocess.Popen(
+            cmdlist,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE if stdin is not None else None)
     except OSError as e:
+        out = b''
         err = e.strerror
         ret = e.errno
+    else:
+        out, err = proc.communicate(stdin)
+        ret = proc.returncode
 
-    out = string_decode(out, urwid.util.detected_encoding)
-    err = string_decode(err, urwid.util.detected_encoding)
+    out = string_decode(out, termenc)
+    err = string_decode(err, termenc)
     return out, err, ret
 
 
-def call_cmd_async(cmdlist, stdin=None, env=None):
-    """
-    get a shell commands output, error message and return value as a deferred.
+async def call_cmd_async(cmdlist, stdin=None, env=None):
+    """Given a command, call that command asynchronously and return the output.
+
+    This function only handles `OSError` when creating the subprocess, any
+    other exceptions raised either durring subprocess creation or while
+    exchanging data with the subprocess are the caller's responsibility to
+    handle.
+
+    If such an `OSError` is caught, then returncode will be set to 1, and the
+    error value will be set to the str() value of the exception.
 
     :type cmdlist: list of str
     :param stdin: string to pipe to the process
     :type stdin: str
-    :return: deferred that calls back with triple of stdout, stderr and
-             return value of the shell command
-    :rtype: `twisted.internet.defer.Deferred`
+    :return: Tuple of stdout, stderr, returncode
+    :rtype: tuple[str, str, int]
     """
+    termenc = urwid.util.detected_encoding
+    cmdlist = [s.encode(termenc) for s in cmdlist]
 
-    class _EverythingGetter(ProcessProtocol):
-        def __init__(self, deferred):
-            self.deferred = deferred
-            self.outBuf = StringIO()
-            self.errBuf = StringIO()
-            self.outReceived = self.outBuf.write
-            self.errReceived = self.errBuf.write
-
-        def processEnded(self, status):
-            termenc = urwid.util.detected_encoding
-            out = string_decode(self.outBuf.getvalue(), termenc)
-            err = string_decode(self.errBuf.getvalue(), termenc)
-            if status.value.exitCode == 0:
-                self.deferred.callback(out)
-            else:
-                terminated_obj = status.value
-                terminated_obj.stderr = err
-                self.deferred.errback(terminated_obj)
-
-    d = Deferred()
-    environment = os.environ
+    environment = os.environ.copy()
     if env is not None:
         environment.update(env)
     logging.debug('ENV = %s', environment)
     logging.debug('CMD = %s', cmdlist)
-    proc = reactor.spawnProcess(_EverythingGetter(d), executable=cmdlist[0],
-                                env=environment,
-                                args=cmdlist)
-    if stdin:
-        logging.debug('writing to stdin')
-        proc.write(stdin)
-        proc.closeStdin()
-    return d
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmdlist,
+            env=environment,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.PIPE if stdin else None)
+    except OSError as e:
+        return ('', str(e), 1)
+    out, err = await proc.communicate(stdin.encode(termenc) if stdin else None)
+    return (out.decode(termenc), err.decode(termenc), proc.returncode)
 
 
 def guess_mimetype(blob):
@@ -411,6 +399,17 @@ def guess_encoding(blob):
         raise Exception('Unknown magic API')
 
 
+def try_decode(blob):
+    """Guess the encoding of blob and try to decode it into a str.
+
+    :param bytes blob: The bytes to decode
+    :returns: the decoded blob
+    :rtype: str
+    """
+    assert isinstance(blob, bytes), 'cannot decode a str or non-bytes object'
+    return blob.decode(guess_encoding(blob))
+
+
 def libmagic_version_at_least(version):
     """
     checks if the libmagic library installed is more recent than a given
@@ -430,6 +429,11 @@ def libmagic_version_at_least(version):
         # The magic_version function has been introduced in libmagic 5.13,
         # if it's not present, we can't guess right, so let's assume False
         return False
+
+    # Depending on the libmagic/ctypes version, magic_version is a function or
+    # a callable:
+    if callable(magic_wrapper.magic_version):
+        return magic_wrapper.magic_version() >= version
 
     return magic_wrapper.magic_version >= version
 
@@ -499,17 +503,6 @@ def shell_quote(text):
     return "'%s'" % text.replace("'", """'"'"'""")
 
 
-def tag_cmp(a, b):
-    r'''
-    Sorting tags using this function puts all tags of length 1 at the
-    beginning. This groups all tags mapped to unicode characters.
-    '''
-    if min(len(a), len(b)) == 1 and max(len(a), len(b)) > 1:
-        return cmp(len(a), len(b))
-    else:
-        return cmp(a.lower(), b.lower())
-
-
 def humanize_size(size):
     """Create a nice human readable representation of the given number
     (understood as bytes) using the "KiB" and "MiB" suffixes to indicate
@@ -555,12 +548,12 @@ def parse_mailto(mailto_str):
     :rtype: tuple(dict(str->list(str)), str)
     """
     if mailto_str.startswith('mailto:'):
-        import urllib
+        import urllib.parse
         to_str, parms_str = mailto_str[7:].partition('?')[::2]
         headers = {}
-        body = u''
+        body = ''
 
-        to = urllib.unquote(to_str)
+        to = urllib.parse.unquote(to_str)
         if to:
             headers['To'] = [to]
 
@@ -568,9 +561,9 @@ def parse_mailto(mailto_str):
             key, value = s.partition('=')[::2]
             key = key.capitalize()
             if key == 'Body':
-                body = urllib.unquote(value)
+                body = urllib.parse.unquote(value)
             elif value:
-                headers[key] = [urllib.unquote(value)]
+                headers[key] = [urllib.parse.unquote(value)]
         return (headers, body)
     else:
         return (None, None)
@@ -592,8 +585,7 @@ def RFC3156_canonicalize(text):
     This function works as follows (in that order):
 
     1. Convert all line endings to \\\\r\\\\n (DOS line endings).
-    2. Ensure the text ends with a newline (\\\\r\\\\n).
-    3. Encode all occurences of "From " at the beginning of a line
+    2. Encode all occurrences of "From " at the beginning of a line
        to "From=20" in order to prevent other mail programs to replace
        this with "> From" (to avoid MBox conflicts) and thus invalidate
        the signature.
@@ -602,35 +594,11 @@ def RFC3156_canonicalize(text):
     :rtype: str
     """
     text = re.sub("\r?\n", "\r\n", text)
-    if not text.endswith("\r\n"):
-        text += "\r\n"
     text = re.sub("^From ", "From=20", text, flags=re.MULTILINE)
     return text
 
 
-def email_as_string(mail):
-    """
-    Converts the given message to a string, without mangling "From" lines
-    (like as_string() does).
-
-    :param mail: email to convert to string
-    :rtype: str
-    """
-    fp = StringIO()
-    g = Generator(fp, mangle_from_=False, maxheaderlen=78)
-    g.flatten(mail)
-    as_string = RFC3156_canonicalize(fp.getvalue())
-
-    if isinstance(mail, MIMEMultipart):
-        # Get the boundary for later
-        boundary = mail.get_boundary()
-
-        # Workaround for http://bugs.python.org/issue14983:
-        # Insert a newline before the outer mail boundary so that other mail
-        # clients can verify the signature when sending an email which contains
-        # attachments.
-        as_string = re.sub(r'--(\r\n)--' + boundary,
-                           r'--\g<1>\g<1>--' + boundary,
-                           as_string, flags=re.MULTILINE)
-
-    return as_string
+def get_xdg_env(env_name, fallback):
+    """ Used for XDG_* env variables to return fallback if unset *or* empty """
+    env = os.environ.get(env_name)
+    return env if env else fallback

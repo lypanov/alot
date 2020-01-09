@@ -1,7 +1,7 @@
 .. _config.options:
 
-Config options
-==============
+Configuration Options
+=====================
 
 The following lists all available config options with their type and default values.
 The type of an option is used to validate a given value. For instance,
@@ -10,4 +10,18 @@ otherwise alot will complain on startup. Strings *may* be quoted but do not need
 
 .. include:: alotrc_table
 
-.. _account:
+Notmuch options
+---------------
+
+The following lists the notmuch options that alot reads.
+
+.. _search.exclude_tags:
+
+.. describe:: search.exclude_tags
+
+     A  list  of tags that will be excluded from search results by
+     default. Using an excluded tag in a query will override  that
+     exclusion.
+
+    :type: semicolon separated list
+    :default: empty list

@@ -1,43 +1,10 @@
 # Copyright (C) 2011-2012  Patrick Totzke <patricktotzke@gmail.com>
+# Copyright © 2017-2018 Dylan Baker <dylan@pnwbakers.com>
 # This file is released under the GNU GPL, version 3 or a later revision.
 # For further details see the COPYING file
-from __future__ import absolute_import
+import gpg
 
-import os
-from cStringIO import StringIO
-import gpgme
 from .errors import GPGProblem, GPGCode
-
-
-def _hash_algo_name(hash_algo):
-    """
-    Re-implements GPGME's hash_algo_name as long as pygpgme doesn't wrap that
-    function.
-
-    :param hash_algo: GPGME hash_algo
-    :rtype: str
-    """
-    mapping = {
-        gpgme.MD_MD5: "MD5",
-        gpgme.MD_SHA1: "SHA1",
-        gpgme.MD_RMD160: "RIPEMD160",
-        gpgme.MD_MD2: "MD2",
-        gpgme.MD_TIGER: "TIGER192",
-        gpgme.MD_HAVAL: "HAVAL",
-        gpgme.MD_SHA256: "SHA256",
-        gpgme.MD_SHA384: "SHA384",
-        gpgme.MD_SHA512: "SHA512",
-        gpgme.MD_MD4: "MD4",
-        gpgme.MD_CRC32: "CRC32",
-        gpgme.MD_CRC32_RFC1510: "CRC32RFC1510",
-        gpgme.MD_CRC24_RFC2440: "CRC24RFC2440",
-    }
-    if hash_algo in mapping:
-        return mapping[hash_algo]
-    else:
-        raise GPGProblem(("Invalid hash_algo passed to hash_algo_name."
-                          " Please report this as a bug in alot."),
-                         code=GPGCode.INVALID_HASH)
 
 
 def RFC3156_micalg_from_algo(hash_algo):
@@ -47,12 +14,16 @@ def RFC3156_micalg_from_algo(hash_algo):
     GPGME returns hash algorithm names such as "SHA256", but RFC3156 says that
     programs need to use names such as "pgp-sha256" instead.
 
-    :param hash_algo: GPGME hash_algo
+    :param str hash_algo: GPGME hash_algo
+    :returns: the lowercase name of of the algorithm with "pgp-" prepended
     :rtype: str
     """
     # hash_algo will be something like SHA256, but we need pgp-sha256.
-    hash_algo = _hash_algo_name(hash_algo)
-    return 'pgp-' + hash_algo.lower()
+    algo = gpg.core.hash_algo_name(hash_algo)
+    if algo is None:
+        raise GPGProblem('Unknown hash algorithm {}'.format(algo),
+                         code=GPGCode.INVALID_HASH_ALGORITHM)
+    return 'pgp-' + algo.lower()
 
 
 def get_key(keyid, validate=False, encrypt=False, sign=False,
@@ -81,23 +52,33 @@ def get_key(keyid, validate=False, encrypt=False, sign=False,
     :param signed_only: only return keys  whose uid is signed (trusted to
         belong to the key)
     :type signed_only: bool
-    :rtype: gpgme.Key
+    :returns: A gpg key matching the given parameters
+    :rtype: gpg.gpgme._gpgme_key
+    :raises ~alot.errors.GPGProblem: if the keyid is ambiguous
+    :raises ~alot.errors.GPGProblem: if there is no key that matches the
+        parameters
+    :raises ~alot.errors.GPGProblem: if a key is found, but signed_only is true
+        and the key is unused
     """
-    ctx = gpgme.Context()
+    ctx = gpg.core.Context()
     try:
         key = ctx.get_key(keyid)
         if validate:
             validate_key(key, encrypt=encrypt, sign=sign)
-    except gpgme.GpgmeError as e:
-        if e.code == gpgme.ERR_AMBIGUOUS_NAME:
+    except gpg.errors.KeyNotFound:
+        raise GPGProblem('Cannot find key for "{}".'.format(keyid),
+                         code=GPGCode.NOT_FOUND)
+    except gpg.errors.GPGMEError as e:
+        if e.getcode() == gpg.errors.AMBIGUOUS_NAME:
             # When we get here it means there were multiple keys returned by
             # gpg for given keyid. Unfortunately gpgme returns invalid and
             # expired keys together with valid keys. If only one key is valid
             # for given operation maybe we can still return it instead of
             # raising exception
-            keys = list_keys(hint=keyid)
+
             valid_key = None
-            for k in keys:
+
+            for k in list_keys(hint=keyid):
                 try:
                     validate_key(k, encrypt=encrypt, sign=sign)
                 except GPGProblem:
@@ -107,144 +88,184 @@ def get_key(keyid, validate=False, encrypt=False, sign=False,
                 if valid_key:
                     # we have already found one valid key and now we find
                     # another? We really received an ambiguous keyid
-                    raise GPGProblem(("More than one key found matching " +
-                                      "this filter. Please be more " +
-                                      "specific (use a key ID like " +
-                                      "4AC8EE1D)."),
-                                     code=GPGCode.AMBIGUOUS_NAME)
+                    raise GPGProblem(
+                        "More than one key found matching this filter. "
+                        "Please be more specific "
+                        "(use a key ID like 4AC8EE1D).",
+                        code=GPGCode.AMBIGUOUS_NAME)
                 valid_key = k
 
             if not valid_key:
                 # there were multiple keys found but none of them are valid for
                 # given action (we don't have private key, they are expired
-                # etc)
+                # etc), or there was no key at all
                 raise GPGProblem(
-                    "Can not find usable key for \'" +
-                    keyid +
-                    "\'.",
+                    'Can not find usable key for "{}".'.format(keyid),
                     code=GPGCode.NOT_FOUND)
             return valid_key
-        elif e.code == gpgme.ERR_INV_VALUE or e.code == gpgme.ERR_EOF:
-            raise GPGProblem("Can not find key for \'" + keyid + "\'.",
-                             code=GPGCode.NOT_FOUND)
+        elif e.getcode() == gpg.errors.INV_VALUE:
+            raise GPGProblem(
+                'Can not find usable key for "{}".'.format(keyid),
+                code=GPGCode.NOT_FOUND)
         else:
-            raise e
+            raise e  # pragma: nocover
     if signed_only and not check_uid_validity(key, keyid):
-        raise GPGProblem("Can not find a trusworthy key for '" + keyid + "'.",
-                         code=GPGCode.NOT_FOUND)
+        raise GPGProblem(
+            'Cannot find a trusworthy key for "{}".'.format(keyid),
+            code=GPGCode.NOT_FOUND)
     return key
 
 
 def list_keys(hint=None, private=False):
     """
-    Returns a list of all keys containing keyid.
+    Returns a generator of all keys containing the fingerprint, or all keys if
+    hint is None.
 
-    :param keyid: The part we search for
-    :param private: Whether secret keys are listed
-    :rtype: list
+    The generator may raise exceptions of :class:gpg.errors.GPGMEError, and it
+    is the caller's responsibility to handle them.
+
+    :param hint: Part of a fingerprint to usee to search
+    :type hint: str or None
+    :param private: Whether to return public keys or secret keys
+    :type private: bool
+    :returns: A generator that yields keys.
+    :rtype: Generator[gpg.gpgme.gpgme_key_t, None, None]
     """
-    ctx = gpgme.Context()
+    ctx = gpg.core.Context()
     return ctx.keylist(hint, private)
 
 
-def detached_signature_for(plaintext_str, key=None):
+def detached_signature_for(plaintext_str, keys):
     """
     Signs the given plaintext string and returns the detached signature.
 
     A detached signature in GPG speak is a separate blob of data containing
     a signature for the specified plaintext.
 
-    :param plaintext_str: text to sign
-    :param key: gpgme_key_t object representing the key to use
-    :rtype: tuple of gpgme.NewSignature array and str
+    :param bytes plaintext_str: bytestring to sign
+    :param keys: list of one or more key to sign with.
+    :type keys: list[gpg.gpgme._gpgme_key]
+    :returns: A list of signature and the signed blob of data
+    :rtype: tuple[list[gpg.results.NewSignature], str]
     """
-    ctx = gpgme.Context()
-    ctx.armor = True
-    if key is not None:
-        ctx.signers = [key]
-    plaintext_data = StringIO(plaintext_str)
-    signature_data = StringIO()
-    sigs = ctx.sign(plaintext_data, signature_data, gpgme.SIG_MODE_DETACH)
-    signature_data.seek(0, os.SEEK_SET)
-    signature = signature_data.read()
-    return sigs, signature
+    ctx = gpg.core.Context(armor=True)
+    ctx.signers = keys
+    (sigblob, sign_result) = ctx.sign(plaintext_str,
+                                      mode=gpg.constants.SIG_MODE_DETACH)
+    return sign_result.signatures, sigblob
 
 
-def encrypt(plaintext_str, keys=None):
-    """
-    Encrypts the given plaintext string and returns a PGP/MIME compatible
-    string
+def encrypt(plaintext_str, keys):
+    """Encrypt data and return the encrypted form.
 
-    :param plaintext_str: the mail to encrypt
-    :param key: gpgme_key_t object representing the key to use
-    :rtype: a string holding the encrypted mail
+    :param bytes plaintext_str: the mail to encrypt
+    :param key: optionally, a list of keys to encrypt with
+    :type key: list[gpg.gpgme.gpgme_key_t] or None
+    :returns: encrypted mail
+    :rtype: str
     """
-    plaintext_data = StringIO(plaintext_str)
-    encrypted_data = StringIO()
-    ctx = gpgme.Context()
-    ctx.armor = True
-    ctx.encrypt(keys, gpgme.ENCRYPT_ALWAYS_TRUST, plaintext_data,
-                encrypted_data)
-    encrypted_data.seek(0, os.SEEK_SET)
-    encrypted = encrypted_data.read()
-    return encrypted
+    assert keys, 'Must provide at least one key to encrypt with'
+    ctx = gpg.core.Context(armor=True)
+    out = ctx.encrypt(plaintext_str, recipients=keys, sign=False,
+                      always_trust=True)[0]
+    return out
+
+
+NO_ERROR = None
+
+
+def bad_signatures_to_str(error):
+    """
+    Convert a bad signature exception to a text message.
+    This is a workaround for gpg not handling non-ascii data correctly.
+
+    :param BadSignatures error: BadSignatures exception
+    """
+    return ", ".join("{}: {}".format(s.fpr,
+                                     "Bad signature for key(s)")
+                     for s in error.result.signatures
+                     if s.status != NO_ERROR)
 
 
 def verify_detached(message, signature):
-    '''Verifies whether the message is authentic by checking the
-    signature.
+    """Verifies whether the message is authentic by checking the signature.
 
-    :param message: the message as `str`
-    :param signature: a `str` containing an OpenPGP signature
-    :returns: a list of :class:`gpgme.Signature`
-    :raises: :class:`~alot.errors.GPGProblem` if the verification fails
-    '''
-    message_data = StringIO(message)
-    signature_data = StringIO(signature)
-    ctx = gpgme.Context()
+    :param bytes message: The message to be verified, in canonical form.
+    :param bytes signature: the OpenPGP signature to verify
+    :returns: a list of signatures
+    :rtype: list[gpg.results.Signature]
+    :raises alot.errors.GPGProblem: if the verification fails
+    """
+    ctx = gpg.core.Context()
     try:
-        return ctx.verify(signature_data, message_data, None)
-    except gpgme.GpgmeError as e:
-        raise GPGProblem(e.message, code=e.code)
+        verify_results = ctx.verify(message, signature)[1]
+        return verify_results.signatures
+    except gpg.errors.BadSignatures as e:
+        raise GPGProblem(bad_signatures_to_str(e), code=GPGCode.BAD_SIGNATURE)
+    except gpg.errors.GPGMEError as e:
+        raise GPGProblem(str(e), code=e.getcode())
 
 
-def decrypt_verify(encrypted):
-    '''Decrypts the given ciphertext string and returns both the
+def decrypt_verify(encrypted, session_keys=None):
+    """Decrypts the given ciphertext string and returns both the
     signatures (if any) and the plaintext.
 
-    :param encrypted: the mail to decrypt
-    :returns: a tuple (sigs, plaintext) with sigs being a list of a
-              :class:`gpgme.Signature` and plaintext is a `str` holding
-              the decrypted mail
-    :raises: :class:`~alot.errors.GPGProblem` if the decryption fails
-    '''
-    encrypted_data = StringIO(encrypted)
-    plaintext_data = StringIO()
-    ctx = gpgme.Context()
+    :param bytes encrypted: the mail to decrypt
+    :param list[str] session_keys: a list OpenPGP session keys
+    :returns: the signatures and decrypted plaintext data
+    :rtype: tuple[list[gpg.resuit.Signature], str]
+    :raises alot.errors.GPGProblem: if the decryption fails
+    """
+    if session_keys is not None:
+        try:
+            return _decrypt_verify_session_keys(encrypted, session_keys)
+        except GPGProblem:
+            pass
+
+    ctx = gpg.core.Context()
+    return _decrypt_verify_with_context(ctx, encrypted)
+
+
+def _decrypt_verify_session_keys(encrypted, session_keys):
+    """Decrypts the given ciphertext string using the session_keys
+    and returns both the signatures (if any) and the plaintext.
+
+    :param bytes encrypted: the mail to decrypt
+    :param list[str] session_keys: a list OpenPGP session keys
+    :returns: the signatures and decrypted plaintext data
+    :rtype: tuple[list[gpg.resuit.Signature], str]
+    :raises alot.errors.GPGProblem: if the decryption fails
+    """
+    for key in session_keys:
+        ctx = gpg.core.Context()
+        ctx.set_ctx_flag("override-session-key", key)
+        try:
+            return _decrypt_verify_with_context(ctx, encrypted)
+        except GPGProblem:
+            continue
+    raise GPGProblem("No valid session key", code=GPGCode.NOT_FOUND)
+
+
+def _decrypt_verify_with_context(ctx, encrypted):
+    """Decrypts the given ciphertext string using the gpg context
+    and returns both the signatures (if any) and the plaintext.
+
+    :param gpg.Context ctx: the gpg context
+    :param bytes encrypted: the mail to decrypt
+    :returns: the signatures and decrypted plaintext data
+    :rtype: tuple[list[gpg.resuit.Signature], str]
+    :raises alot.errors.GPGProblem: if the decryption fails
+    """
     try:
-        sigs = ctx.decrypt_verify(encrypted_data, plaintext_data)
-    except gpgme.GpgmeError as e:
-        raise GPGProblem(e.message, code=e.code)
-
-    plaintext_data.seek(0, os.SEEK_SET)
-    return sigs, plaintext_data.read()
-
-
-def hash_key(key):
-    """
-    Returns a hash of the given key. This is a workaround for
-    https://bugs.launchpad.net/pygpgme/+bug/1089865
-    and can be removed if the missing feature is added to pygpgme.
-
-    :param key: the key we want a hash of
-    :type key: gpgme.Key
-    :returns: a hash of the key
-    :rtype: str
-    """
-    hash_str = ""
-    for tmp_key in key.subkeys:
-        hash_str += tmp_key.keyid
-    return hash_str
+        (plaintext, _, verify_result) = ctx.decrypt(
+                encrypted, verify=True)
+        sigs = verify_result.signatures
+    except gpg.errors.GPGMEError as e:
+        raise GPGProblem(str(e), code=e.getcode())
+    except gpg.errors.BadSignatures as e:
+        (plaintext, _, _) = ctx.decrypt(encrypted, verify=False)
+        sigs = e.result.signatures
+    return sigs, plaintext
 
 
 def validate_key(key, sign=False, encrypt=False):
@@ -252,28 +273,34 @@ def validate_key(key, sign=False, encrypt=False):
     signing or encrypting.  Raise GPGProblem otherwise.
 
     :param key: the GPG key to check
-    :type key: gpgme.Key
+    :type key: gpg.gpgme._gpgme_key
     :param sign: whether the key should be able to sign
     :type sign: bool
     :param encrypt: whether the key should be able to encrypt
     :type encrypt: bool
-
+    :raises ~alot.errors.GPGProblem: If the key is revoked, expired, or invalid
+    :raises ~alot.errors.GPGProblem: If encrypt is true and the key cannot be
+        used to encrypt
+    :raises ~alot.errors.GPGProblem: If sign is true and th key cannot be used
+        to encrypt
     """
     if key.revoked:
-        raise GPGProblem("The key \"" + key.uids[0].uid + "\" is revoked.",
+        raise GPGProblem('The key "{}" is revoked.'.format(key.uids[0].uid),
                          code=GPGCode.KEY_REVOKED)
     elif key.expired:
-        raise GPGProblem("The key \"" + key.uids[0].uid + "\" is expired.",
+        raise GPGProblem('The key "{}" is expired.'.format(key.uids[0].uid),
                          code=GPGCode.KEY_EXPIRED)
     elif key.invalid:
-        raise GPGProblem("The key \"" + key.uids[0].uid + "\" is invalid.",
+        raise GPGProblem('The key "{}" is invalid.'.format(key.uids[0].uid),
                          code=GPGCode.KEY_INVALID)
     if encrypt and not key.can_encrypt:
-        raise GPGProblem("The key \"" + key.uids[0].uid + "\" can not " +
-                         "encrypt.", code=GPGCode.KEY_CANNOT_ENCRYPT)
+        raise GPGProblem(
+            'The key "{}" cannot be used to encrypt'.format(key.uids[0].uid),
+            code=GPGCode.KEY_CANNOT_ENCRYPT)
     if sign and not key.can_sign:
-        raise GPGProblem("The key \"" + key.uids[0].uid + "\" can not sign.",
-                         code=GPGCode.KEY_CANNOT_SIGN)
+        raise GPGProblem(
+            'The key "{}" cannot be used to sign'.format(key.uids[0].uid),
+            code=GPGCode.KEY_CANNOT_SIGN)
 
 
 def check_uid_validity(key, email):
@@ -282,15 +309,16 @@ def check_uid_validity(key, email):
     email is assumed to belong to the key.
 
     :param key: the GPG key to which the email should belong
-    :type key: gpgme.Key
+    :type key: gpg.gpgme._gpgme_key
     :param email: the email address that should belong to the key
     :type email: str
     :returns: whether the key can be assumed to belong to the given email
     :rtype: bool
-
     """
-    for key_uid in key.uids:
-        if email == key_uid.email and not key_uid.revoked and \
-                not key_uid.invalid and key_uid.validity >= 4:
-            return True
-    return False
+    def check(key_uid):
+        return (email == key_uid.email and
+                not key_uid.revoked and
+                not key_uid.invalid and
+                key_uid.validity >= gpg.constants.validity.FULL)
+
+    return any(check(u) for u in key.uids)

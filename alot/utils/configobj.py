@@ -1,11 +1,9 @@
 # Copyright (C) 2011-2012  Patrick Totzke <patricktotzke@gmail.com>
 # This file is released under the GNU GPL, version 3 or a later revision.
 # For further details see the COPYING file
-from __future__ import absolute_import
-
 import mailbox
 import re
-from urlparse import urlparse
+from urllib.parse import urlparse
 
 from validate import VdtTypeError
 from validate import is_list
@@ -47,7 +45,7 @@ def attr_triple(value):
         normal = AttrSpec(acc['16fg'], acc['16bg'], 16)
         high = AttrSpec(acc['256fg'], acc['256bg'], 256)
     except AttrSpecError as e:
-        raise ValidateError(e.message)
+        raise ValidateError(str(e))
     return mono, normal, high
 
 
@@ -92,24 +90,23 @@ def mail_container(value):
     """
     Check that the value points to a valid mail container,
     in URI-style, e.g.: `mbox:///home/username/mail/mail.box`.
+    `~`-expansion will work, e.g.: `mbox://~/mail/mail.box`.
     The value is cast to a :class:`mailbox.Mailbox` object.
     """
     if not re.match(r'.*://.*', value):
         raise VdtTypeError(value)
     mburl = urlparse(value)
-    if mburl.scheme == 'mbox':
-        box = mailbox.mbox(mburl.path)
-    elif mburl.scheme == 'maildir':
-        box = mailbox.Maildir(mburl.path)
-    elif mburl.scheme == 'mh':
-        box = mailbox.MH(mburl.path)
-    elif mburl.scheme == 'babyl':
-        box = mailbox.Babyl(mburl.path)
-    elif mburl.scheme == 'mmdf':
-        box = mailbox.MMDF(mburl.path)
-    else:
-        raise VdtTypeError(value)
-    return box
+    uri_scheme_to_mbclass = {
+            'mbox': mailbox.mbox,
+            'maildir': mailbox.Maildir,
+            'mh': mailbox.MH,
+            'babyl': mailbox.Babyl,
+            'mmdf': mailbox.MMDF,
+        }
+    klass = uri_scheme_to_mbclass.get(mburl.scheme)
+    if klass:
+        return klass(mburl.netloc + mburl.path)
+    raise VdtTypeError(value)
 
 
 def force_list(value, min=None, max=None):
@@ -118,7 +115,7 @@ def force_list(value, min=None, max=None):
     a list with one member.
 
     You can optionally specify the minimum and maximum number of members.
-    A minumum of greater than one will fail if the user only supplies a
+    A minimum of greater than one will fail if the user only supplies a
     string.
 
     The difference to :func:`validate.force_list` is that this test
@@ -136,9 +133,9 @@ def force_list(value, min=None, max=None):
 def gpg_key(value):
     """
     test if value points to a known gpg key
-    and return that key as :class:`pyme.pygpgme._gpgme_key`.
+    and return that key as a gpg key object.
     """
     try:
         return crypto.get_key(value)
     except GPGProblem as e:
-        raise ValidateError(e.message)
+        raise ValidateError(str(e))

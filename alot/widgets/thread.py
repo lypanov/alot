@@ -4,8 +4,6 @@
 """
 Widgets specific to thread mode
 """
-from __future__ import absolute_import
-
 import logging
 import urwid
 
@@ -14,10 +12,9 @@ from urwidtrees import Tree, SimpleTree, CollapsibleTree
 from .ansi import ANSIText
 from .globals import TagWidget
 from .globals import AttachmentWidget
-from ..settings import settings
+from ..settings.const import settings
 from ..db.utils import decode_header, X_SIGNATURE_MESSAGE_HEADER
-from ..db.utils import extract_body
-from ..helper import tag_cmp
+from ..helper import string_sanitize
 
 
 class MessageSummaryWidget(urwid.WidgetWrap):
@@ -49,12 +46,11 @@ class MessageSummaryWidget(urwid.WidgetWrap):
         if settings.get('msg_summary_hides_threadwide_tags'):
             thread_tags = message.get_thread().get_tags(intersection=True)
             outstanding_tags = set(message.get_tags()).difference(thread_tags)
-            tag_widgets = [TagWidget(t, attr, focus_att)
-                           for t in outstanding_tags]
+            tag_widgets = sorted(TagWidget(t, attr, focus_att)
+                                 for t in outstanding_tags)
         else:
-            tag_widgets = [TagWidget(t, attr, focus_att)
-                           for t in message.get_tags()]
-        tag_widgets.sort(tag_cmp, lambda tag_widget: tag_widget.translated)
+            tag_widgets = sorted(TagWidget(t, attr, focus_att)
+                                 for t in message.get_tags())
         for tag_widget in tag_widgets:
             if not tag_widget.hidden:
                 cols.append(('fixed', tag_widget.width(), tag_widget))
@@ -84,9 +80,16 @@ class TextlinesList(SimpleTree):
         for each line in content.
         """
         structure = []
-        for line in content.splitlines():
-            ansi_background = settings.get("interpret_ansi_background")
-            structure.append((ANSIText(line, attr, attr_focus,
+
+        # depending on this config setting, we either add individual lines
+        # or the complete context as focusable objects.
+        ansi_background = settings.get("interpret_ansi_background")
+        if settings.get('thread_focus_linewise'):
+            for line in content.splitlines():
+                structure.append((ANSIText(line, attr, attr_focus,
+                                           ansi_background), None))
+        else:
+            structure.append((ANSIText(content, attr, attr_focus,
                                        ansi_background), None))
         SimpleTree.__init__(self, structure)
 
@@ -158,7 +161,7 @@ class MessageTree(CollapsibleTree):
         self._default_headers_tree = None
         self.display_attachments = True
         self._attachments = None
-        self._maintree = SimpleTree(self._assemble_structure())
+        self._maintree = SimpleTree(self._assemble_structure(True))
         CollapsibleTree.__init__(self, self._maintree)
 
     def get_message(self):
@@ -180,7 +183,23 @@ class MessageTree(CollapsibleTree):
         logging.debug('DHT %s', str(self._default_headers_tree))
         logging.debug('MAINTREE %s', str(self._maintree._treelist))
 
-    def _assemble_structure(self):
+    def expand(self, pos):
+        """
+        overload CollapsibleTree.expand method to ensure all parts are present.
+        Initially, only the summary widget is created to avoid reading the
+        messafe file and thus speed up the creation of this object. Once we
+        expand = unfold the message, we need to make sure that body/attachments
+        exist.
+        """
+        logging.debug("MT expand")
+        if not self._bodytree:
+            self.reassemble()
+        CollapsibleTree.expand(self, pos)
+
+    def _assemble_structure(self, summary_only=False):
+        if summary_only:
+            return [(self._get_summary(), None)]
+
         mainstruct = []
         if self.display_source:
             mainstruct.append((self._get_source(), None))
@@ -193,7 +212,7 @@ class MessageTree(CollapsibleTree):
 
             bodytree = self._get_body()
             if bodytree is not None:
-                mainstruct.append((self._get_body(), None))
+                mainstruct.append((bodytree, None))
 
         structure = [
             (self._get_summary(), mainstruct)
@@ -217,6 +236,7 @@ class MessageTree(CollapsibleTree):
     def _get_source(self):
         if self._sourcetree is None:
             sourcetxt = self._message.get_email().as_string()
+            sourcetxt = string_sanitize(sourcetxt)
             att = settings.get_theming_attribute('thread', 'body')
             att_focus = settings.get_theming_attribute('thread', 'body_focus')
             self._sourcetree = TextlinesList(sourcetxt, att, att_focus)
@@ -224,7 +244,7 @@ class MessageTree(CollapsibleTree):
 
     def _get_body(self):
         if self._bodytree is None:
-            bodytxt = extract_body(self._message.get_email())
+            bodytxt = self._message.get_body_text()
             if bodytxt:
                 att = settings.get_theming_attribute('thread', 'body')
                 att_focus = settings.get_theming_attribute(
@@ -260,7 +280,6 @@ class MessageTree(CollapsibleTree):
 
         if headers is None:
             # collect all header/value pairs in the order they appear
-            headers = mail.keys()
             for key, value in mail.items():
                 dvalue = decode_header(value, normalize=normalize)
                 lines.append((key, dvalue))

@@ -24,16 +24,29 @@ _alot_search()
     '--sort=[sort results]:sorting:((newest_first\:"reverse chronological order" oldest_first\:"chronological order" message_id\:"lexicographically by Message Id"))'
 }
 
+_alot_account_emails()
+{
+  python3 - ${XDG_CONFIG_HOME:-~/.config}/alot/config <<-'EOF'
+	import configobj, sys
+	config = configobj.ConfigObj(infile=sys.argv[1], encoding="UTF8")
+	accounts = config.get("accounts", {})
+	addresses = [accounts[k].get('address') for k in accounts
+							 if type(accounts[k]) is configobj.Section]
+	print(" ".join(addresses), end="")
+	EOF
+}
+
 _alot_compose()
 {
   _arguments -s : \
+    '--attach=[Attach files]:attach:_files -/' \
+    '--bcc=[Blind Carbon Copy header]:Recipient (Bcc header):_email_addresses' \
+    '--cc=[Carbon Copy header]:Recipient (Cc header):_email_addresses' \
     '--omit_signature[do not add signature]' \
-    '--sender=[From header]' \
+    "--sender=[From header]:Sender account:($(_alot_account_emails))" \
     '--subject=[Subject header]' \
-    '--cc=[Carbon Copy header]' \
-    '--bcc=[Blind Carbon Copy header]' \
     '--template=[template file to use]' \
-    '--attach=[Attach files]:attach:_files -/'\
+    '--to=[To header]:Recipient (To header):_email_addresses' \
 }
 
 _alot()

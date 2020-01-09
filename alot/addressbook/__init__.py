@@ -1,8 +1,6 @@
 # Copyright (C) 2011-2015  Patrick Totzke <patricktotzke@gmail.com>
 # This file is released under the GNU GPL, version 3 or a later revision.
 # For further details see the COPYING file
-from __future__ import absolute_import
-
 import re
 import abc
 
@@ -11,7 +9,7 @@ class AddressbookError(Exception):
     pass
 
 
-class AddressBook(object):
+class AddressBook:
     """can look up email addresses and realnames for contacts.
 
     .. note::
@@ -27,19 +25,15 @@ class AddressBook(object):
         self.reflags = re.IGNORECASE if ignorecase else 0
 
     @abc.abstractmethod
-    def get_contacts(self):
+    def get_contacts(self):  # pragma no cover
         """list all contacts tuples in this abook as (name, email) tuples"""
         return []
 
     def lookup(self, query=''):
         """looks up all contacts where name or address match query"""
         res = []
-        query = '.*%s.*' % query
+        query = re.compile('.*%s.*' % re.escape(query), self.reflags)
         for name, email in self.get_contacts():
-            try:
-                if re.match(query, name, self.reflags) or \
-                        re.match(query, email, self.reflags):
-                    res.append((name, email))
-            except:
-                pass
+            if query.match(name) or query.match(email):
+                res.append((name, email))
         return res

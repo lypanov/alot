@@ -1,13 +1,12 @@
 # Copyright (C) 2011-2015  Patrick Totzke <patricktotzke@gmail.com>
 # This file is released under the GNU GPL, version 3 or a later revision.
 # For further details see the COPYING file
-from __future__ import absolute_import
-
 import re
 
 from ..helper import call_cmd
 from ..helper import split_commandstring
 from . import AddressBook, AddressbookError
+import logging
 
 
 class ExternalAddressbook(AddressBook):
@@ -44,7 +43,7 @@ class ExternalAddressbook(AddressBook):
     def get_contacts(self):
         return self._call_and_parse(self.commandline)
 
-    def lookup(self, prefix):
+    def lookup(self, prefix):  # pragma: no cover
         if self.external_filtering:
             return self._call_and_parse(self.commandline + " " + prefix)
         else:
@@ -61,15 +60,18 @@ class ExternalAddressbook(AddressBook):
             raise AddressbookError(msg)
 
         if not resultstring:
+            logging.debug("No contacts in address book (empty string)")
             return []
         lines = resultstring.splitlines()
         res = []
+        logging.debug("Apply %s on %d results" % (self.regex, len(lines)))
         for l in lines:
             m = re.match(self.regex, l, self.reflags)
             if m:
                 info = m.groupdict()
-                if 'email' and 'name' in info:
+                if 'email' in info and 'name' in info:
                     email = info['email'].strip()
                     name = info['name']
                     res.append((name, email))
+                    logging.debug("New match name=%s mail=%s" % (name, email))
         return res

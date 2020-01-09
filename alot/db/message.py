@@ -1,27 +1,26 @@
 # Copyright (C) 2011-2012  Patrick Totzke <patricktotzke@gmail.com>
 # This file is released under the GNU GPL, version 3 or a later revision.
 # For further details see the COPYING file
-from __future__ import absolute_import
-
 import email
 import email.charset as charset
+import email.policy
 import functools
 from datetime import datetime
 
 from notmuch import NullPointerError
 
-from .utils import extract_headers, extract_body, message_from_file
+from . import utils
+from .utils import extract_body
 from .utils import decode_header
 from .attachment import Attachment
 from .. import helper
-from ..settings import settings
+from ..settings.const import settings
 
 charset.add_charset('utf-8', charset.QP, charset.QP, 'utf-8')
 
 
 @functools.total_ordering
-class Message(object):
-
+class Message:
     """
     a persistent notmuch message object.
     It it uses a :class:`~alot.db.DBManager` for cached manipulation
@@ -45,13 +44,28 @@ class Message(object):
         except ValueError:
             self._datetime = None
         self._filename = msg.get_filename()
-        try:
-            self._from = decode_header(msg.get_header('From'))
-        except NullPointerError:
-            self._from = ''
         self._email = None  # will be read upon first use
         self._attachments = None  # will be read upon first use
         self._tags = set(msg.get_tags())
+
+        self._session_keys = []
+        for name, value in msg.get_properties("session-key", exact=True):
+            if name == "session-key":
+                self._session_keys.append(value)
+
+        try:
+            sender = decode_header(msg.get_header('From'))
+            if not sender:
+                sender = decode_header(msg.get_header('Sender'))
+        except NullPointerError:
+            sender = None
+        if sender:
+            self._from = sender
+        elif 'draft' in self._tags:
+            acc = settings.get_accounts()[0]
+            self._from = '"{}" <{}>'.format(acc.realname, str(acc.address))
+        else:
+            self._from = '"Unknown" <>'
 
     def __str__(self):
         """prettyprint the message"""
@@ -66,30 +80,32 @@ class Message(object):
 
     def __eq__(self, other):
         if isinstance(other, type(self)):
-            return self.get_message_id() == other.get_message_id()
+            return self._id == other.get_message_id()
         return NotImplemented
 
     def __ne__(self, other):
         if isinstance(other, type(self)):
-            return self.get_message_id() != other.get_message_id()
+            return self._id != other.get_message_id()
         return NotImplemented
 
     def __lt__(self, other):
         if isinstance(other, type(self)):
-            return self.get_message_id() < other.get_message_id()
+            return self._id < other.get_message_id()
         return NotImplemented
 
     def get_email(self):
-        """returns :class:`email.Message` for this message"""
+        """returns :class:`email.email.EmailMessage` for this message"""
         path = self.get_filename()
         warning = "Subject: Caution!\n"\
                   "Message file is no longer accessible:\n%s" % path
         if not self._email:
             try:
-                with open(path) as f:
-                    self._email = message_from_file(f)
+                with open(path, 'rb') as f:
+                    self._email = utils.decrypted_message_from_bytes(
+                            f.read(), self._session_keys)
             except IOError:
-                self._email = email.message_from_string(warning)
+                self._email = email.message_from_string(
+                    warning, policy=email.policy.SMTP)
         return self._email
 
     def get_date(self):
@@ -116,8 +132,7 @@ class Message(object):
 
     def get_tags(self):
         """returns tags attached to this message as list of strings"""
-        l = sorted(self._tags)
-        return l
+        return sorted(self._tags)
 
     def get_thread(self):
         """returns the :class:`~alot.db.Thread` this msg belongs to"""
@@ -155,18 +170,7 @@ class Message(object):
 
         :rtype: (str,str)
         """
-        return email.Utils.parseaddr(self._from)
-
-    def get_headers_string(self, headers):
-        """
-        returns subset of this messages headers as human-readable format:
-        all header values are decoded, the resulting string has
-        one line "KEY: VALUE" for each requested header present in the mail.
-
-        :param headers: headers to extract
-        :type headers: list of str
-        """
-        return extract_headers(self.get_email(), headers)
+        return email.utils.parseaddr(self._from)
 
     def add_tags(self, tags, afterwards=None, remove_rest=False):
         """
@@ -242,10 +246,13 @@ class Message(object):
                 if ct in ['octet/stream', 'application/octet-stream']:
                     content = part.get_payload(decode=True)
                     ct = helper.guess_mimetype(content)
+                    if (self._attachments and
+                            self._attachments[-1].get_content_type() ==
+                            'application/pgp-encrypted'):
+                        self._attachments.pop()
 
                 if cd.lower().startswith('attachment'):
-                    if ct.lower() not in ['application/pgp-encrypted',
-                                          'application/pgp-signature']:
+                    if ct.lower() not in ['application/pgp-signature']:
                         self._attachments.append(Attachment(part))
                 elif cd.lower().startswith('inline'):
                     if (filename is not None and
@@ -253,17 +260,12 @@ class Message(object):
                         self._attachments.append(Attachment(part))
         return self._attachments
 
-    def accumulate_body(self):
-        """
-        returns bodystring extracted from this mail
-        """
+    def get_body_text(self):
+        """ returns bodystring extracted from this mail """
         # TODO: allow toggle commands to decide which part is considered body
         return extract_body(self.get_email())
 
-    def get_text_content(self):
-        return extract_body(self.get_email(), types=['text/plain'])
-
     def matches(self, querystring):
         """tests if this messages is in the resultset for `querystring`"""
-        searchfor = querystring + ' AND id:' + self._id
+        searchfor = '( {} ) AND id:{}'.format(querystring, self._id)
         return self._dbman.count_messages(searchfor) > 0

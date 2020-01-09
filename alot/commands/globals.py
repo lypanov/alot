@@ -1,9 +1,7 @@
 # Copyright (C) 2011-2012  Patrick Totzke <patricktotzke@gmail.com>
+# Copyright © 2018 Dylan Baker
 # This file is released under the GNU GPL, version 3 or a later revision.
 # For further details see the COPYING file
-from __future__ import absolute_import
-from __future__ import division
-
 import argparse
 import code
 import email
@@ -12,52 +10,54 @@ import glob
 import logging
 import os
 import subprocess
-from StringIO import StringIO
+from io import BytesIO
+import asyncio
+import shlex
 
 import urwid
-from twisted.internet.defer import inlineCallbacks
-from twisted.internet import threads
 
 from . import Command, registerCommand
 from . import CommandCanceled
-from .utils import set_encrypt
+from .utils import update_keys
 from .. import commands
 
 from .. import buffers
 from .. import helper
 from ..helper import split_commandstring
 from ..helper import mailto_to_envelope
-from ..completion import CommandLineCompleter
-from ..completion import ContactsCompleter
-from ..completion import AccountCompleter
-from ..completion import TagsCompleter
+from ..completion.commandline import CommandLineCompleter
+from ..completion.contacts import ContactsCompleter
+from ..completion.accounts import AccountCompleter
+from ..completion.tags import TagsCompleter
 from ..widgets.utils import DialogBox
 from ..db.errors import DatabaseLockedError
 from ..db.envelope import Envelope
-from ..settings import settings
+from ..settings.const import settings
+from ..settings.errors import ConfigError, NoMatchingAccount
 from ..utils import argparse as cargparse
 
 MODE = 'global'
 
 
-@registerCommand(MODE, 'exit')
+@registerCommand(MODE, 'exit', help="shut down cleanly")
 class ExitCommand(Command):
-    """Shut down cleanly.
-
-    The _prompt variable is for internal use only, it's used to control
-    prompting to close without sending, and is used by the BufferCloseCommand
-    if settings change after yielding to the UI.
-    """
+    """Shut down cleanly."""
 
     def __init__(self, _prompt=True, **kwargs):
+        """
+        :param _prompt: For internal use only, used to control prompting to
+                        close without sending, and is used by the
+                        BufferCloseCommand if settings change after yielding to
+                        the UI.
+        :type _prompt: bool
+        """
         super(ExitCommand, self).__init__(**kwargs)
         self.prompt_to_send = _prompt
 
-    @inlineCallbacks
-    def apply(self, ui):
+    async def apply(self, ui):
         if settings.get('bug_on_exit'):
             msg = 'really quit?'
-            if (yield ui.choice(msg, select='yes', cancel='no',
+            if (await ui.choice(msg, select='yes', cancel='no',
                                 msg_position='left')) == 'no':
                 return
 
@@ -66,20 +66,20 @@ class ExitCommand(Command):
             for buffer in ui.buffers:
                 if (isinstance(buffer, buffers.EnvelopeBuffer) and
                         not buffer.envelope.sent_time):
-                    if (yield ui.choice('quit without sending message?',
-                                        select='yes', cancel='no',
+                    msg = 'quit without sending message?'
+                    if (await ui.choice(msg, cancel='no',
                                         msg_position='left')) == 'no':
                         raise CommandCanceled()
 
         for b in ui.buffers:
             b.cleanup()
-        ui.apply_command(FlushCommand(callback=ui.exit))
+        await ui.apply_command(FlushCommand(callback=ui.exit))
         ui.cleanup()
 
         if ui.db_was_locked:
             msg = 'Database locked. Exit without saving?'
-            if (yield ui.choice(msg, select='yes', cancel='no',
-                                msg_position='left')) == 'no':
+            response = await ui.choice(msg, msg_position='left', cancel='no')
+            if response == 'no':
                 return
             ui.exit()
 
@@ -90,7 +90,8 @@ class ExitCommand(Command):
     (['query'], {'nargs': argparse.REMAINDER, 'help': 'search string'})])
 class SearchCommand(Command):
 
-    """open a new search buffer"""
+    """open a new search buffer. Search obeys the notmuch
+    :ref:`search.exclude_tags <search.exclude_tags>` setting."""
     repeatable = True
 
     def __init__(self, query, sort=None, **kwargs):
@@ -140,12 +141,11 @@ class PromptCommand(Command):
         self.startwith = startwith
         Command.__init__(self, **kwargs)
 
-    @inlineCallbacks
-    def apply(self, ui):
+    async def apply(self, ui):
         logging.info('open command shell')
         mode = ui.mode or 'global'
         cmpl = CommandLineCompleter(ui.dbman, mode, ui.current_buffer)
-        cmdline = yield ui.prompt(
+        cmdline = await ui.prompt(
             '',
             text=self.startwith,
             completer=cmpl,
@@ -156,7 +156,7 @@ class PromptCommand(Command):
         if cmdline:
             # save into prompt history
             ui.commandprompthistory.append(cmdline)
-            ui.apply_commandline(cmdline)
+            await ui.apply_commandline(cmdline)
         else:
             raise CommandCanceled()
 
@@ -209,7 +209,7 @@ class ExternalCommand(Command):
         """
         logging.debug({'spawn': spawn})
         # make sure cmd is a list of str
-        if isinstance(cmd, unicode):
+        if isinstance(cmd, str):
             # convert cmdstring to list: in case shell==True,
             # Popen passes only the first item in the list to $SHELL
             cmd = [cmd] if shell else split_commandstring(cmd)
@@ -240,7 +240,7 @@ class ExternalCommand(Command):
         self.on_success = on_success
         Command.__init__(self, **kwargs)
 
-    def apply(self, ui):
+    async def apply(self, ui):
         logging.debug('cmdlist: %s', self.cmdlist)
         callerbuffer = ui.current_buffer
 
@@ -248,56 +248,69 @@ class ExternalCommand(Command):
         stdin = None
         if self.stdin is not None:
             # wrap strings in StrinIO so that they behaves like a file
-            if isinstance(self.stdin, unicode):
-                stdin = StringIO(self.stdin)
+            if isinstance(self.stdin, str):
+                # XXX: is utf-8 always safe to use here, or do we need to check
+                # the terminal encoding first?
+                stdin = BytesIO(self.stdin.encode('utf-8'))
             else:
                 stdin = self.stdin
 
-        def afterwards(data):
-            if data == 'success':
-                if callable(self.on_success):
-                    self.on_success()
-            else:
-                ui.notify(data, priority='error')
-            if self.refocus and callerbuffer in ui.buffers:
-                logging.info('refocussing')
-                ui.buffer_focus(callerbuffer)
-
         logging.info('calling external command: %s', self.cmdlist)
 
-        def thread_code(*_):
-            try:
-                if stdin is None:
-                    proc = subprocess.Popen(self.cmdlist, shell=self.shell,
-                                            stderr=subprocess.PIPE)
-                    ret = proc.wait()
-                    err = proc.stderr.read()
-                else:
-                    proc = subprocess.Popen(self.cmdlist, shell=self.shell,
-                                            stdin=subprocess.PIPE,
-                                            stderr=subprocess.PIPE)
-                    _, err = proc.communicate(stdin.read())
-                    ret = proc.wait()
-                if ret == 0:
-                    return 'success'
-                else:
-                    return err.strip()
-            except OSError as e:
-                return str(e)
-
+        ret = ''
+        # TODO: these can probably be refactored in terms of helper.call_cmd
+        # and helper.call_cmd_async
         if self.in_thread:
-            d = threads.deferToThread(thread_code)
-            d.addCallback(afterwards)
+            try:
+                if self.shell:
+                    _cmd = asyncio.create_subprocess_shell
+                    # The shell function wants a single string or bytestring,
+                    # we could just join it, but lets be extra safe and use
+                    # shlex.quote to avoid suprises.
+                    cmdlist = [shlex.quote(' '.join(self.cmdlist))]
+                else:
+                    _cmd = asyncio.create_subprocess_exec
+                    cmdlist = self.cmdlist
+                proc = await _cmd(
+                    *cmdlist,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.PIPE if stdin else None)
+            except OSError as e:
+                ret = str(e)
+            else:
+                _, err = await proc.communicate(stdin.read() if stdin else None)
+                if proc.returncode == 0:
+                    ret = 'success'
+                elif err:
+                    ret = err.decode(urwid.util.detected_encoding)
         else:
-            ui.mainloop.screen.stop()
-            ret = thread_code()
-            ui.mainloop.screen.start()
+            with ui.paused():
+                try:
+                    proc = subprocess.Popen(
+                        self.cmdlist, shell=self.shell,
+                        stdin=subprocess.PIPE if stdin else None,
+                        stderr=subprocess.PIPE)
+                except OSError as e:
+                    ret = str(e)
+                else:
+                    _, err = proc.communicate(stdin.read() if stdin else None)
+                if proc.returncode == 0:
+                    ret = 'success'
+                elif err:
+                    ret = err.decode(urwid.util.detected_encoding)
 
-            # make sure urwid renders its canvas at the correct size
-            ui.mainloop.screen_size = None
-            ui.mainloop.draw_screen()
-
-            afterwards(ret)
+        if ret == 'success':
+            if self.on_success is not None:
+                self.on_success()
+        else:
+            msg = "editor has exited with error code {} -- {}".format(
+                    proc.returncode,
+                    ret or "No stderr output")
+            ui.notify(msg, priority='error')
+        if self.refocus and callerbuffer in ui.buffers:
+            logging.info('refocussing')
+            ui.buffer_focus(callerbuffer)
 
 
 class EditCommand(ExternalCommand):
@@ -327,23 +340,24 @@ class EditCommand(ExternalCommand):
         logging.debug('using editor_cmd: %s', editor_cmdstring)
 
         self.cmdlist = None
-        if '%s' in editor_cmdstring:
-            cmdstring = editor_cmdstring.replace('%s',
-                                                 helper.shell_quote(path))
-            self.cmdlist = split_commandstring(cmdstring)
-        else:
-            self.cmdlist = split_commandstring(editor_cmdstring) + [path]
+        if editor_cmdstring:
+            if '%s' in editor_cmdstring:
+                cmdstring = editor_cmdstring.replace('%s',
+                                                     helper.shell_quote(path))
+                self.cmdlist = split_commandstring(cmdstring)
+            else:
+                self.cmdlist = split_commandstring(editor_cmdstring) + [path]
 
         logging.debug({'spawn: ': self.spawn, 'in_thread': self.thread})
         ExternalCommand.__init__(self, self.cmdlist,
                                  spawn=self.spawn, thread=self.thread,
                                  **kwargs)
 
-    def apply(self, ui):
+    async def apply(self, ui):
         if self.cmdlist is None:
             ui.notify('no editor set', priority='error')
         else:
-            return ExternalCommand.apply(self, ui)
+            return await ExternalCommand.apply(self, ui)
 
 
 @registerCommand(MODE, 'pyshell')
@@ -353,21 +367,20 @@ class PythonShellCommand(Command):
     repeatable = True
 
     def apply(self, ui):
-        ui.mainloop.screen.stop()
-        code.interact(local=locals())
-        ui.mainloop.screen.start()
+        with ui.paused():
+            code.interact(local=locals())
 
 
 @registerCommand(MODE, 'repeat')
 class RepeatCommand(Command):
 
-    """Repeats the command executed last time"""
+    """repeat the command executed last time"""
     def __init__(self, **kwargs):
         Command.__init__(self, **kwargs)
 
-    def apply(self, ui):
+    async def apply(self, ui):
         if ui.last_commandline is not None:
-            ui.apply_commandline(ui.last_commandline)
+            await ui.apply_commandline(ui.last_commandline)
         else:
             ui.notify('no last command')
 
@@ -376,7 +389,7 @@ class RepeatCommand(Command):
     (['command'], {'help': 'python command string to call'})])
 class CallCommand(Command):
 
-    """Executes python code"""
+    """execute python code"""
     repeatable = True
 
     def __init__(self, command, **kwargs):
@@ -387,16 +400,18 @@ class CallCommand(Command):
         Command.__init__(self, **kwargs)
         self.command = command
 
-    def apply(self, ui):
+    async def apply(self, ui):
         try:
             hooks = settings.hooks
             if hooks:
                 env = {'ui': ui, 'settings': settings}
-                for k, v in env.iteritems():
-                    if k not in hooks.__dict__:
-                        hooks.__dict__[k] = v
+                for k, v in env.items():
+                    if not getattr(hooks, k, None):
+                        setattr(hooks, k, v)
 
-            exec(self.command)
+            t = eval(self.command)
+            if asyncio.iscoroutine(t):
+                await t
         except Exception as e:
             logging.exception(e)
             msg = 'an error occurred during execution of "%s":\n%s'
@@ -426,9 +441,8 @@ class BufferCloseCommand(Command):
         self.redraw = redraw
         Command.__init__(self, **kwargs)
 
-    @inlineCallbacks
-    def apply(self, ui):
-        def one_buffer(prompt=True):
+    async def apply(self, ui):
+        async def one_buffer(prompt=True):
             """Helper to handle the case on only one buffer being opened.
 
             prompt is a boolean that is passed to ExitCommand() as the _prompt
@@ -445,27 +459,27 @@ class BufferCloseCommand(Command):
             # 'close without sending'
             else:
                 logging.info('closing the last buffer, exiting')
-                ui.apply_command(ExitCommand(_prompt=prompt))
+                await ui.apply_command(ExitCommand(_prompt=prompt))
 
         if self.buffer is None:
             self.buffer = ui.current_buffer
 
         if len(ui.buffers) == 1:
-            one_buffer()
+            await one_buffer()
             return
 
         if (isinstance(self.buffer, buffers.EnvelopeBuffer) and
                 not self.buffer.envelope.sent_time):
-            if (not self.force and (yield ui.choice('close without sending?',
-                                                    select='yes', cancel='no',
+            msg = 'close without sending?'
+            if (not self.force and (await ui.choice(msg, cancel='no',
                                                     msg_position='left')) ==
                     'no'):
                 raise CommandCanceled()
 
-        # Because we yield above it is possible that the settings or the number
+        # Because we await above it is possible that the settings or the number
         # of buffers chould change, so retest.
         if len(ui.buffers) == 1:
-            one_buffer(prompt=False)
+            await one_buffer(prompt=False)
         else:
             ui.buffer_close(self.buffer, self.redraw)
 
@@ -562,6 +576,21 @@ class TagListCommand(Command):
             ui.buffer_open(buffers.TagListBuffer(ui, tags, self.filtfun))
 
 
+@registerCommand(MODE, 'namedqueries')
+class NamedQueriesCommand(Command):
+    """opens named queries buffer"""
+    def __init__(self, filtfun=bool, **kwargs):
+        """
+        :param filtfun: filter to apply to displayed list
+        :type filtfun: callable (str->bool)
+        """
+        self.filtfun = filtfun
+        Command.__init__(self, **kwargs)
+
+    def apply(self, ui):
+        ui.buffer_open(buffers.NamedQueriesBuffer(ui, self.filtfun))
+
+
 @registerCommand(MODE, 'flush')
 class FlushCommand(Command):
 
@@ -610,8 +639,8 @@ class FlushCommand(Command):
     (['commandname'], {'help': 'command or \'bindings\''})])
 class HelpCommand(Command):
 
-    """display help for a command. Use \'bindings\' to display all keybings
-    interpreted in current mode.'"""
+    """display help for a command (use \'bindings\' to display all keybindings
+    interpreted in current mode)"""
     def __init__(self, commandname='', **kwargs):
         """
         :param commandname: command to document
@@ -630,8 +659,8 @@ class HelpCommand(Command):
             globalmaps, modemaps = settings.get_keybindings(ui.mode)
 
             # build table
-            maxkeylength = len(max((modemaps).keys() + globalmaps.keys(),
-                                   key=len))
+            maxkeylength = len(
+                max(list(modemaps.keys()) + list(globalmaps.keys()), key=len))
             keycolumnwidth = maxkeylength + 2
 
             linewidgets = []
@@ -639,7 +668,7 @@ class HelpCommand(Command):
             if modemaps:
                 txt = (section_att, '\n%s-mode specific maps' % ui.mode)
                 linewidgets.append(urwid.Text(txt))
-                for (k, v) in modemaps.iteritems():
+                for (k, v) in modemaps.items():
                     line = urwid.Columns([('fixed', keycolumnwidth,
                                            urwid.Text((text_att, k))),
                                           urwid.Text((text_att, v))])
@@ -647,7 +676,7 @@ class HelpCommand(Command):
 
             # global maps
             linewidgets.append(urwid.Text((section_att, '\nglobal maps')))
-            for (k, v) in globalmaps.iteritems():
+            for (k, v) in globalmaps.items():
                 if k not in modemaps:
                     line = urwid.Columns(
                         [('fixed', keycolumnwidth, urwid.Text((text_att, k))),
@@ -680,6 +709,8 @@ class HelpCommand(Command):
     (['--sender'], {'nargs': '?', 'help': 'sender'}),
     (['--template'], {'nargs': '?',
                       'help': 'path to a template message file'}),
+    (['--tags'], {'nargs': '?',
+                  'help': 'comma-separated list of tags to apply to message'}),
     (['--subject'], {'nargs': '?', 'help': 'subject line'}),
     (['--to'], {'nargs': '+', 'help': 'recipients'}),
     (['--cc'], {'nargs': '+', 'help': 'copy to'}),
@@ -694,10 +725,12 @@ class HelpCommand(Command):
 class ComposeCommand(Command):
 
     """compose a new email"""
-    def __init__(self, envelope=None, headers=None, template=None, sender=u'',
-                 subject=u'', to=None, cc=None, bcc=None, attach=None,
-                 omit_signature=False, spawn=None, rest=None, encrypt=False,
-                 **kwargs):
+    def __init__(
+            self,
+            envelope=None, headers=None, template=None, sender='',
+            tags=None, subject='', to=None, cc=None, bcc=None, attach=None,
+            omit_signature=False, spawn=None, rest=None, encrypt=False,
+            **kwargs):
         """
         :param envelope: use existing envelope
         :type envelope: :class:`~alot.db.envelope.Envelope`
@@ -709,6 +742,8 @@ class ComposeCommand(Command):
         :type template: str
         :param sender: From-header value
         :type sender: str
+        :param tags: Comma-separated list of tags to apply to message
+        :type tags: list(str)
         :param subject: Subject-header value
         :type subject: str
         :param to: To-header value
@@ -746,9 +781,130 @@ class ComposeCommand(Command):
         self.force_spawn = spawn
         self.rest = ' '.join(rest or [])
         self.encrypt = encrypt
+        self.tags = tags
 
-    @inlineCallbacks
-    def apply(self, ui):
+    class ApplyError(Exception):
+        pass
+
+    def _get_template(self, ui):
+        # get location of tempsdir, containing msg templates
+        tempdir = settings.get('template_dir')
+
+        path = os.path.expanduser(self.template)
+        if not os.path.dirname(path):  # use tempsdir
+            if not os.path.isdir(tempdir):
+                ui.notify('no templates directory: %s' % tempdir,
+                          priority='error')
+                raise self.ApplyError()
+            path = os.path.join(tempdir, path)
+
+        if not os.path.isfile(path):
+            ui.notify('could not find template: %s' % path,
+                      priority='error')
+            raise self.ApplyError()
+        try:
+            with open(path, 'rb') as f:
+                template = helper.try_decode(f.read())
+            self.envelope.parse_template(template)
+        except Exception as e:
+            ui.notify(str(e), priority='error')
+            raise self.ApplyError()
+
+    async def _get_sender_details(self, ui):
+        # find out the right account, if possible yet
+        account = self.envelope.account
+        if account is None:
+            accounts = settings.get_accounts()
+            if not accounts:
+                ui.notify('no accounts set.', priority='error')
+                return
+            elif len(accounts) == 1:
+                account = accounts[0]
+
+        # get missing From header
+        if 'From' not in self.envelope.headers:
+            if account is not None:
+                fromstring = email.utils.formataddr(
+                    (account.realname, str(account.address)))
+                self.envelope.add('From', fromstring)
+            else:
+                cmpl = AccountCompleter()
+                fromaddress = await ui.prompt('From', completer=cmpl,
+                                              tab=1, history=ui.senderhistory)
+                if fromaddress is None:
+                    raise CommandCanceled()
+
+                ui.senderhistory.append(fromaddress)
+                self.envelope.add('From', fromaddress)
+        else:
+            fromaddress = self.envelope.get("From")
+
+        # try to find the account again
+        if account is None:
+            try:
+                account = settings.account_matching_address(fromaddress)
+            except NoMatchingAccount:
+                msg = 'Cannot compose mail - ' \
+                      'no account found for `%s`' % fromaddress
+                logging.error(msg)
+                ui.notify(msg, priority='error')
+                raise CommandCanceled()
+        if self.envelope.account is None:
+            self.envelope.account = account
+
+    async def _set_signature(self, ui):
+        account = self.envelope.account
+        if not self.omit_signature and account.signature:
+            logging.debug('has signature')
+            sig = os.path.expanduser(account.signature)
+            if os.path.isfile(sig):
+                logging.debug('is file')
+                if account.signature_as_attachment:
+                    name = account.signature_filename or None
+                    self.envelope.attach(sig, filename=name)
+                    logging.debug('attached')
+                else:
+                    with open(sig, 'rb') as f:
+                        sigcontent = f.read()
+                    mimetype = helper.guess_mimetype(sigcontent)
+                    if mimetype.startswith('text'):
+                        sigcontent = helper.try_decode(sigcontent)
+                        self.envelope.body += '\n' + sigcontent
+            else:
+                ui.notify('could not locate signature: %s' % sig,
+                          priority='error')
+                if (await ui.choice('send without signature?', 'yes',
+                                    'no')) == 'no':
+                    raise self.ApplyError
+
+    async def apply(self, ui):
+        try:
+            await self.__apply(ui)
+        except self.ApplyError:
+            return
+
+    def _get_account(self, ui):
+        # find out the right account
+        sender = self.envelope.get('From')
+        _, addr = email.utils.parseaddr(sender)
+        try:
+            account = settings.get_account_by_address(addr)
+        except NoMatchingAccount:
+            msg = 'Cannot compose mail - no account found for `%s`' % addr
+            logging.error(msg)
+            ui.notify(msg, priority='error')
+            raise CommandCanceled()
+
+        if account is None:
+            accounts = settings.get_accounts()
+            if not accounts:
+                ui.notify('no accounts set.', priority='error')
+                raise self.ApplyError
+            account = accounts[0]
+
+        return account
+
+    def _set_envelope(self):
         if self.envelope is None:
             if self.rest:
                 if self.rest.startswith('mailto'):
@@ -758,36 +914,57 @@ class ComposeCommand(Command):
                     self.envelope.add('To', self.rest)
             else:
                 self.envelope = Envelope()
-        if self.template is not None:
-            # get location of tempsdir, containing msg templates
-            tempdir = settings.get('template_dir')
-            tempdir = os.path.expanduser(tempdir)
-            if not tempdir:
-                xdgdir = os.environ.get('XDG_CONFIG_HOME',
-                                        os.path.expanduser('~/.config'))
-                tempdir = os.path.join(xdgdir, 'alot', 'templates')
 
-            path = os.path.expanduser(self.template)
-            if not os.path.dirname(path):  # use tempsdir
-                if not os.path.isdir(tempdir):
-                    ui.notify('no templates directory: %s' % tempdir,
-                              priority='error')
-                    return
-                path = os.path.join(tempdir, path)
+    def _set_gpg_sign(self, ui):
+        account = self.envelope.account
+        if account.sign_by_default:
+            if account.gpg_key:
+                self.envelope.sign = account.sign_by_default
+                self.envelope.sign_key = account.gpg_key
+            else:
+                msg = 'Cannot find gpg key for account {}'
+                msg = msg.format(account.address)
+                logging.warning(msg)
+                ui.notify(msg, priority='error')
 
-            if not os.path.isfile(path):
-                ui.notify('could not find template: %s' % path,
-                          priority='error')
-                return
-            try:
-                with open(path) as f:
-                    self.envelope.parse_template(f.read())
-            except Exception as e:
-                ui.notify(str(e), priority='error')
-                return
+    async def _set_to(self, ui):
+        account = self.envelope.account
+        if 'To' not in self.envelope.headers:
+            allbooks = not settings.get('complete_matching_abook_only')
+            logging.debug(allbooks)
+            abooks = settings.get_addressbooks(order=[account],
+                                               append_remaining=allbooks)
+            logging.debug(abooks)
+            completer = ContactsCompleter(abooks)
+            to = await ui.prompt('To', completer=completer,
+                                 history=ui.recipienthistory)
+            if to is None:
+                raise CommandCanceled()
 
+            to = to.strip(' \t\n,')
+            ui.recipienthistory.append(to)
+            self.envelope.add('To', to)
+
+    async def _set_gpg_encrypt(self, ui):
+        account = self.envelope.account
+        if self.encrypt or account.encrypt_by_default == "all":
+            logging.debug("Trying to encrypt message because encrypt=%s and "
+                          "encrypt_by_default=%s", self.encrypt,
+                          account.encrypt_by_default)
+            await update_keys(ui, self.envelope, block_error=self.encrypt)
+        elif account.encrypt_by_default == "trusted":
+            logging.debug("Trying to encrypt message because "
+                          "account.encrypt_by_default=%s",
+                          account.encrypt_by_default)
+            await update_keys(ui, self.envelope, block_error=self.encrypt,
+                              signed_only=True)
+        else:
+            logging.debug("No encryption by default, encrypt_by_default=%s",
+                          account.encrypt_by_default)
+
+    def _set_base_attributes(self):
         # set forced headers
-        for key, value in self.headers.iteritems():
+        for key, value in self.headers.items():
             self.envelope.add(key, value)
 
         # set forced headers for separate parameters
@@ -801,125 +978,67 @@ class ComposeCommand(Command):
             self.envelope.add('Cc', ','.join(self.cc))
         if self.bcc:
             self.envelope.add('Bcc', ','.join(self.bcc))
+        if self.tags:
+            self.envelope.tags = [t for t in self.tags.split(',') if t]
 
-        # get missing From header
-        if 'From' not in self.envelope.headers:
-            accounts = settings.get_accounts()
-            if len(accounts) == 1:
-                a = accounts[0]
-                fromstring = email.utils.formataddr((a.realname, a.address))
-                self.envelope.add('From', fromstring)
-            else:
-                cmpl = AccountCompleter()
-                fromaddress = yield ui.prompt('From', completer=cmpl,
-                                              tab=1, history=ui.senderhistory)
-                if fromaddress is None:
-                    raise CommandCanceled()
-
-                ui.senderhistory.append(fromaddress)
-                self.envelope.add('From', fromaddress)
-
-        # find out the right account
-        sender = self.envelope.get('From')
-        name, addr = email.Utils.parseaddr(sender)
-        account = settings.get_account_by_address(addr)
-        if account is None:
-            accounts = settings.get_accounts()
-            if not accounts:
-                ui.notify('no accounts set.', priority='error')
-                return
-            account = accounts[0]
-
-        # add signature
-        if not self.omit_signature and account.signature:
-            logging.debug('has signature')
-            sig = os.path.expanduser(account.signature)
-            if os.path.isfile(sig):
-                logging.debug('is file')
-                if account.signature_as_attachment:
-                    name = account.signature_filename or None
-                    self.envelope.attach(sig, filename=name)
-                    logging.debug('attached')
-                else:
-                    with open(sig) as f:
-                        sigcontent = f.read()
-                    enc = helper.guess_encoding(sigcontent)
-                    mimetype = helper.guess_mimetype(sigcontent)
-                    if mimetype.startswith('text'):
-                        sigcontent = helper.string_decode(sigcontent, enc)
-                        self.envelope.body += '\n' + sigcontent
-            else:
-                ui.notify('could not locate signature: %s' % sig,
-                          priority='error')
-                if (yield ui.choice('send without signature?', 'yes',
-                                    'no')) == 'no':
-                    return
-
-        # Figure out whether we should GPG sign messages by default
-        # and look up key if so
-        self.envelope.sign = account.sign_by_default
-        self.envelope.sign_key = account.gpg_key
-
-        # get missing To header
-        if 'To' not in self.envelope.headers:
-            allbooks = not settings.get('complete_matching_abook_only')
-            logging.debug(allbooks)
-            abooks = settings.get_addressbooks(order=[account],
-                                               append_remaining=allbooks)
-            logging.debug(abooks)
-            completer = ContactsCompleter(abooks)
-            to = yield ui.prompt('To', completer=completer,
-                                 history=ui.recipienthistory)
-            if to is None:
-                raise CommandCanceled()
-
-            to = to.strip(' \t\n,')
-            ui.recipienthistory.append(to)
-            self.envelope.add('To', to)
-
+    async def _set_subject(self, ui):
         if settings.get('ask_subject') and \
                 'Subject' not in self.envelope.headers:
-            subject = yield ui.prompt('Subject')
+            subject = await ui.prompt('Subject')
             logging.debug('SUBJECT: "%s"', subject)
             if subject is None:
                 raise CommandCanceled()
 
             self.envelope.add('Subject', subject)
 
+    async def _set_compose_tags(self, ui):
         if settings.get('compose_ask_tags'):
             comp = TagsCompleter(ui.dbman)
-            tagsstring = yield ui.prompt('Tags', completer=comp)
+            tags = ','.join(self.tags) if self.tags else ''
+            tagsstring = await ui.prompt('Tags', text=tags, completer=comp)
             tags = [t for t in tagsstring.split(',') if t]
             if tags is None:
                 raise CommandCanceled()
 
             self.envelope.tags = tags
 
+    def _set_attachments(self):
         if self.attach:
             for gpath in self.attach:
                 for a in glob.glob(gpath):
                     self.envelope.attach(a)
                     logging.debug('attaching: %s', a)
 
+    async def __apply(self, ui):
+        self._set_envelope()
+        if self.template is not None:
+            self._get_template(ui)
+        # Set headers and tags
+        self._set_base_attributes()
+        # set account and missing From header
+        await self._get_sender_details(ui)
+
+        # add signature
+        await self._set_signature(ui)
+        # Figure out whether we should GPG sign messages by default
+        # and look up key if so
+        self._set_gpg_sign(ui)
+        # get missing To header
+        await self._set_to(ui)
+        # Set subject
+        await self._set_subject(ui)
+        # Add additional tags
+        await self._set_compose_tags(ui)
+        # Set attachments
+        self._set_attachments()
         # set encryption if needed
-        if self.encrypt or account.encrypt_by_default == u"all":
-            logging.debug("Trying to encrypt message because encrypt=%s and "
-                          "encrypt_by_default=%s", self.encrypt,
-                          account.encrypt_by_default)
-            yield set_encrypt(ui, self.envelope, block_error=self.encrypt)
-        elif account.encrypt_by_default == u"trusted":
-            logging.debug("Trying to encrypt message because "
-                          "account.encrypt_by_default=%s",
-                          account.encrypt_by_default)
-            yield set_encrypt(ui, self.envelope, block_error=self.encrypt, signed_only=True)
-        else:
-            logging.debug("No encryption by default, encrypt_by_default=%s",
-                          account.encrypt_by_default)
+        await self._set_gpg_encrypt(ui)
 
         cmd = commands.envelope.EditCommand(envelope=self.envelope,
                                             spawn=self.force_spawn,
                                             refocus=False)
-        ui.apply_command(cmd)
+        await ui.apply_command(cmd)
+
 
 
 @registerCommand(
@@ -927,7 +1046,7 @@ class ComposeCommand(Command):
     arguments=[
         (['movement'],
          {'nargs': argparse.REMAINDER,
-          'help': 'up, down, [half]page up, [half]page down, first'})])
+          'help': 'up, down, [half]page up, [half]page down, first, last'})])
 class MoveCommand(Command):
 
     """move in widget"""
@@ -955,3 +1074,107 @@ class MoveCommand(Command):
         else:
             ui.notify('unknown movement: ' + self.movement,
                       priority='error')
+
+
+@registerCommand(MODE, 'reload', help='reload all configuration files')
+class ReloadCommand(Command):
+
+    """Reload configuration."""
+
+    def apply(self, ui):
+        try:
+            settings.reload()
+        except ConfigError as e:
+            ui.notify('Error when reloading config files:\n {}'.format(e),
+                      priority='error')
+
+
+@registerCommand(
+    MODE, 'savequery',
+    arguments=[
+        (['--no-flush'], {'action': 'store_false', 'dest': 'flush',
+                          'default': 'True',
+                          'help': 'postpone a writeout to the index'}),
+        (['alias'], {'help': 'alias to use for query string'}),
+        (['query'], {'help': 'query string to store',
+                     'nargs': '+'})
+    ],
+    help='store query string as a "named query" in the database')
+class SaveQueryCommand(Command):
+
+    """save alias for query string"""
+    repeatable = False
+
+    def __init__(self, alias, query=None, flush=True, **kwargs):
+        """
+        :param alias: name to use for query string
+        :type alias: str
+        :param query: query string to save
+        :type query: str or None
+        :param flush: immediately write out to the index
+        :type flush: bool
+        """
+        self.alias = alias
+        if query is None:
+            self.query = ''
+        else:
+            self.query = ' '.join(query)
+        self.flush = flush
+        Command.__init__(self, **kwargs)
+
+    def apply(self, ui):
+        msg = 'saved alias "%s" for query string "%s"' % (self.alias,
+                                                          self.query)
+
+        try:
+            ui.dbman.save_named_query(self.alias, self.query)
+            logging.debug(msg)
+            ui.notify(msg)
+        except DatabaseROError:
+            ui.notify('index in read-only mode', priority='error')
+            return
+
+        # flush index
+        if self.flush:
+            ui.apply_command(commands.globals.FlushCommand())
+
+
+@registerCommand(
+    MODE, 'removequery',
+    arguments=[
+        (['--no-flush'], {'action': 'store_false', 'dest': 'flush',
+                          'default': 'True',
+                          'help': 'postpone a writeout to the index'}),
+        (['alias'], {'help': 'alias to remove'}),
+    ],
+    help='removes a "named query" from the database')
+class RemoveQueryCommand(Command):
+
+    """remove named query string for given alias"""
+    repeatable = False
+
+    def __init__(self, alias, flush=True, **kwargs):
+        """
+        :param alias: name to use for query string
+        :type alias: str
+        :param flush: immediately write out to the index
+        :type flush: bool
+        """
+        self.alias = alias
+        self.flush = flush
+        Command.__init__(self, **kwargs)
+
+    def apply(self, ui):
+        msg = 'removed alias "%s"' % (self.alias)
+
+        try:
+            ui.dbman.remove_named_query(self.alias)
+            logging.debug(msg)
+            ui.notify(msg)
+        except DatabaseROError:
+            ui.notify('index in read-only mode', priority='error')
+            return
+
+        # flush index
+        if self.flush:
+            ui.apply_command(commands.globals.FlushCommand())

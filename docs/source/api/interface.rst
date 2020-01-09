@@ -15,22 +15,13 @@ key presses to the wrapped root widget and thereby accessing standard urwid
 behaviour.
 
 In order to keep the interface non-blocking and react to events like
-terminal size changes, alot makes use of twisted's deferred_ - a
-framework that makes it easy to deal with callbacks. Many commands in alot make use of
-`inline callbacks`_, which allow you to treat deferred-returning functions almost like
-syncronous functions. Consider the following example of a function that prompts for some
-input and acts on it:
-
-.. _deferred: http://twistedmatrix.com/documents/current/core/howto/defer.html
-.. _`inline callbacks`: http://twistedmatrix.com/documents/8.1.0/api/twisted.internet.defer.html#inlineCallbacks
+terminal size changes, alot makes use of asyncio - which allows asynchronous calls
+without the use of callbacks. Alot makes use of the python 3.5 async/await syntax
 
 .. code-block:: python
 
-    from twisted.internet import defer
-
-    @defer.inlineCallbacks
-    def greet(ui):  # ui is instance of alot.ui.UI
-        name = yield ui.prompt('pls enter your name')
+    async def greet(ui):  # ui is instance of alot.ui.UI
+        name = await ui.prompt('pls enter your name')
         ui.notify('your name is: ' + name)
 
 
@@ -53,18 +44,19 @@ Different modes are defined by subclasses of the following base class.
 
 Available modes are:
 
-========== ========================================
-   Mode     Buffer Subclass
-========== ========================================
-search     :class:`~alot.buffers.SearchBuffer`
-thread     :class:`~alot.buffers.ThreadBuffer`
-bufferlist :class:`~alot.buffers.BufferlistBuffer`
-taglist    :class:`~alot.buffers.TagListBuffer`
-envelope   :class:`~alot.buffers.EnvelopeBuffer`
-========== ========================================
+============ ========================================
+   Mode       Buffer Subclass
+============ ========================================
+search       :class:`~alot.buffers.SearchBuffer`
+thread       :class:`~alot.buffers.ThreadBuffer`
+bufferlist   :class:`~alot.buffers.BufferlistBuffer`
+taglist      :class:`~alot.buffers.TagListBuffer`
+namedqueries :class:`~alot.buffers.NamedQueriesBuffer`
+envelope     :class:`~alot.buffers.EnvelopeBuffer`
+============ ========================================
 
 .. automodule:: alot.buffers
-    :members: BufferlistBuffer, EnvelopeBuffer,SearchBuffer,ThreadBuffer,TagListBuffer
+    :members: BufferlistBuffer, EnvelopeBuffer, NamedQueriesBuffer, SearchBuffer, ThreadBuffer, TagListBuffer
 
 Widgets
 --------

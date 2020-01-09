@@ -1,8 +1,6 @@
 # Copyright (C) 2011-2012  Patrick Totzke <patricktotzke@gmail.com>
 # This file is released under the GNU GPL, version 3 or a later revision.
 # For further details see the COPYING file
-from __future__ import absolute_import
-
 import os
 
 from ..utils import configobj as checks
@@ -13,7 +11,7 @@ DEFAULTSPATH = os.path.join(os.path.dirname(__file__), '..', 'defaults')
 DUMMYDEFAULT = ('default',) * 6
 
 
-class Theme(object):
+class Theme:
     """Colour theme"""
     def __init__(self, path):
         """
@@ -22,7 +20,7 @@ class Theme(object):
         :raises: :class:`~alot.settings.errors.ConfigError`
         """
         self._spec = os.path.join(DEFAULTSPATH, 'theme.spec')
-        self._config = read_config(path, self._spec,
+        self._config = read_config(path, self._spec, report_extra=True,
                                    checks={'align': checks.align_mode,
                                            'widthtuple': checks.width_tuple,
                                            'force_list': checks.force_list,

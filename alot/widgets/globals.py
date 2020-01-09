@@ -5,14 +5,12 @@
 """
 This contains alot-specific :class:`urwid.Widget` used in more than one mode.
 """
-from __future__ import absolute_import
-
 import re
 import operator
 import urwid
 
 from ..helper import string_decode
-from ..settings import settings
+from ..settings.const import settings
 from ..db.attachment import Attachment
 from ..errors import CompletionError
 
@@ -21,6 +19,7 @@ class AttachmentWidget(urwid.WidgetWrap):
     """
     one-line summary of an :class:`~alot.db.attachment.Attachment`.
     """
+
     def __init__(self, attachment, selectable=True):
         self._selectable = selectable
         self.attachment = attachment
@@ -45,15 +44,16 @@ class AttachmentWidget(urwid.WidgetWrap):
 
 class ChoiceWidget(urwid.Text):
     def __init__(self, choices, callback, cancel=None, select=None,
-                 separator=' '):
+                 separator=' ', choices_to_return=None):
         self.choices = choices
+        self.choices_to_return = choices_to_return or {}
         self.callback = callback
         self.cancel = cancel
         self.select = select
         self.separator = separator
 
         items = []
-        for k, v in choices.iteritems():
+        for k, v in choices.items():
             if v == select and select is not None:
                 items += ['[', k, ']:', v]
             else:
@@ -69,6 +69,8 @@ class ChoiceWidget(urwid.Text):
             self.callback(self.select)
         elif key == 'esc' and self.cancel is not None:
             self.callback(self.cancel)
+        elif key in self.choices_to_return:
+            self.callback(self.choices_to_return[key])
         elif key in self.choices:
             self.callback(self.choices[key])
         else:
@@ -86,8 +88,8 @@ class CompleteEdit(urwid.Edit):
 
     The interpretation of some keypresses is hard-wired:
         :enter: calls 'on_exit' callback with current value
-        :esc/ctrl g: calls 'on_exit' with value `None`, which can be interpreted
-              as cancelation
+        :esc/ctrl g: calls 'on_exit' with value `None`, which can be
+                     interpreted as cancellation
         :tab: calls the completer and tabs forward in the result list
         :shift tab: tabs backward in the result list
         :up/down: move in the local input history
@@ -102,9 +104,10 @@ class CompleteEdit(urwid.Edit):
         :ctrl u: deletes everything from the cursor to the beginning of the
                  input
     """
+
     def __init__(self, completer, on_exit,
                  on_error=None,
-                 edit_text=u'',
+                 edit_text='',
                  history=None,
                  **kwargs):
         """
@@ -127,7 +130,7 @@ class CompleteEdit(urwid.Edit):
         self.historypos = None
         self.focus_in_clist = 0
 
-        if not isinstance(edit_text, unicode):
+        if not isinstance(edit_text, str):
             edit_text = string_decode(edit_text)
         self.start_completion_pos = len(edit_text)
         self.completions = None
@@ -164,10 +167,10 @@ class CompleteEdit(urwid.Edit):
                 if self.historypos is None:
                     self.history.append(self.edit_text)
                     self.historypos = len(self.history) - 1
-                if key == 'cursor up':
-                    self.historypos = (self.historypos + 1) % len(self.history)
-                else:
+                if key == 'up':
                     self.historypos = (self.historypos - 1) % len(self.history)
+                else:
+                    self.historypos = (self.historypos + 1) % len(self.history)
                 self.set_edit_text(self.history[self.historypos])
         elif key == 'enter':
             self.on_exit(self.edit_text)
@@ -231,6 +234,7 @@ class CompleteEdit(urwid.Edit):
 
 class HeadersList(urwid.WidgetWrap):
     """ renders a pile of header values as key/value list """
+
     def __init__(self, headerslist, key_attr, value_attr, gaps_attr=None):
         """
         :param headerslist: list of key/value pairs to display
@@ -277,7 +281,12 @@ class TagWidget(urwid.AttrMap):
 
     It looks up the string it displays in the `tags` section
     of the config as well as custom theme settings for its tag.
+
+    Attributes that should be considered publicly readable:
+        :attr tag: the notmuch tag
+        :type tag: str
     """
+
     def __init__(self, tag, fallback_normal=None, fallback_focus=None):
         self.tag = tag
         representation = settings.get_tagstring_representation(tag,
@@ -286,6 +295,7 @@ class TagWidget(urwid.AttrMap):
         self.translated = representation['translated']
         self.hidden = self.translated == ''
         self.txt = urwid.Text(self.translated, wrap='clip')
+        self.__hash = hash((self.translated, self.txt))
         normal_att = representation['normal']
         focus_att = representation['focussed']
         self.attmaps = {'normal': normal_att, 'focus': focus_att}
@@ -305,11 +315,51 @@ class TagWidget(urwid.AttrMap):
     def keypress(self, size, key):
         return key
 
-    def get_tag(self):
-        return self.tag
-
     def set_focussed(self):
         self.set_attr_map(self.attmaps['focus'])
 
     def set_unfocussed(self):
         self.set_attr_map(self.attmaps['normal'])
+
+    def __cmp(self, other, comparitor):
+        """Shared comparison method."""
+        if not isinstance(other, TagWidget):
+            return NotImplemented
+
+        self_len = len(self.translated)
+        oth_len = len(other.translated)
+
+        if (self_len == 1) is not (oth_len == 1):
+            return comparitor(self_len, oth_len)
+        return comparitor(self.translated.lower(), other.translated.lower())
+
+    def __lt__(self, other):
+        """Groups tags of 1 character first, then alphabetically.
+
+        This groups tags unicode characters at the begnining.
+        """
+        return self.__cmp(other, operator.lt)
+
+    def __gt__(self, other):
+        return self.__cmp(other, operator.gt)
+
+    def __ge__(self, other):
+        return self.__cmp(other, operator.ge)
+
+    def __le__(self, other):
+        return self.__cmp(other, operator.le)
+
+    def __eq__(self, other):
+        if not isinstance(other, TagWidget):
+            return NotImplemented
+        if len(self.translated) != len(other.translated):
+            return False
+        return self.translated.lower() == other.translated.lower()
+
+    def __ne__(self, other):
+        if not isinstance(other, TagWidget):
+            return NotImplemented
+        return self.translated.lower() != other.translated.lower()
+
+    def __hash__(self):
+        return self.__hash

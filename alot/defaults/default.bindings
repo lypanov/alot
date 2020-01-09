@@ -58,6 +58,9 @@ q = exit
 [taglist]
     enter = select
 
+[namedqueries]
+    enter = select
+
 [thread]
     enter = select
     C = fold *
@@ -66,6 +69,8 @@ q = exit
     e = unfold
     < = fold
     > = unfold
+    [ = indent -
+    ] = indent +
     'g f' = togglesource
     H = toggleheaders
     P = print --all --separately --add_tags

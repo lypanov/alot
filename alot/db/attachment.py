@@ -1,12 +1,10 @@
 # Copyright (C) 2011-2012  Patrick Totzke <patricktotzke@gmail.com>
+# Copyright © 2018 Dylan Baker
 # This file is released under the GNU GPL, version 3 or a later revision.
 # For further details see the COPYING file
-from __future__ import absolute_import
-
 import os
 import tempfile
 import email.charset as charset
-from email.header import Header
 from copy import deepcopy
 
 from ..helper import string_decode, humanize_size, guess_mimetype
@@ -15,8 +13,7 @@ from .utils import decode_header
 charset.add_charset('utf-8', charset.QP, charset.QP, 'utf-8')
 
 
-class Attachment(object):
-
+class Attachment:
     """represents a mail attachment"""
 
     def __init__(self, emailpart):
@@ -68,11 +65,11 @@ class Attachment(object):
         if os.path.isdir(path):
             if filename:
                 basename = os.path.basename(filename)
-                file_ = open(os.path.join(path, basename), "w")
+                file_ = open(os.path.join(path, basename), "wb")
             else:
                 file_ = tempfile.NamedTemporaryFile(delete=False, dir=path)
         else:
-            file_ = open(path, "w")  # this throws IOErrors for invalid path
+            file_ = open(path, "wb")  # this throws IOErrors for invalid path
         self.write(file_)
         file_.close()
         return file_.name
@@ -88,8 +85,5 @@ class Attachment(object):
     def get_mime_representation(self):
         """returns mime part that constitutes this attachment"""
         part = deepcopy(self.part)
-        part['Content-Disposition'] = Header(
-            self.part['Content-Disposition'],
-            maxlinelen=78,
-            header_name='Content-Disposition')
+        part.set_param('maxlinelen', '78', header='Content-Disposition')
         return part

@@ -105,7 +105,7 @@
 
 .. describe:: colourmode
 
-     number of colours to use
+     number of colours to use on the terminal
 
     :type: option, one of ['1', '16', '256']
     :default: 256
@@ -192,7 +192,7 @@
 
 .. describe:: editor_spawn
 
-     use terminal_command to spawn a new terminal for the editor?
+     use :ref:`terminal_cmd <terminal-cmd>` to spawn a new terminal for the editor?
      equivalent to always providing the `--spawn=yes` parameter to compose/edit commands
 
     :type: boolean
@@ -232,6 +232,17 @@
 
     :type: mixed_list
     :default: [{buffer_no}: envelope], {input_queue} total messages: {total_messages}
+
+
+.. _exclude-tags:
+
+.. describe:: exclude_tags
+
+     A list of tags that will be excluded from search results by default. Using an excluded tag in a query will override that exclusion.
+     .. note:: this config setting is equivalent to, but independent of, the 'search.exclude_tags' in the notmuch config.
+
+    :type: string list
+    :default: ,
 
 
 .. _flush-retry-timeout:
@@ -294,6 +305,11 @@
 .. describe:: handle_mouse
 
      enable mouse support - mouse tracking will be handled by urwid
+
+     .. note:: If this is set to True mouse events are passed from the terminal
+               to urwid/alot.  This means that normal text selection in alot will
+               not be possible.  Most terminal emulators will still allow you to
+               select text when shift is pressed.
 
     :type: boolean
     :default: False
@@ -374,6 +390,17 @@
     :default: ,
 
 
+.. _message-id-domain:
+
+.. describe:: message_id_domain
+
+     Domain to use in automatically generated Message-ID headers.
+     The default is the local hostname.
+
+    :type: string
+    :default: None
+
+
 .. _msg-summary-hides-threadwide-tags:
 
 .. describe:: msg_summary_hides_threadwide_tags
@@ -383,6 +410,19 @@
 
     :type: boolean
     :default: True
+
+
+.. _namedqueries-statusbar:
+
+.. describe:: namedqueries_statusbar
+
+     Format of the status-bar in named query list mode.
+     This is a pair of strings to be left and right aligned in the status-bar.
+     These strings may contain variables listed at :ref:`bufferlist_statusbar <bufferlist-statusbar>`
+     that will be substituted accordingly.
+
+    :type: mixed_list
+    :default: [{buffer_no}: namedqueries], {query_count} named queries
 
 
 .. _notify-timeout:
@@ -599,10 +639,10 @@
 
 .. describe:: themes_dir
 
-     directory containing theme files
+     directory containing theme files.
 
     :type: string
-    :default: None
+    :default: "$XDG_CONFIG_HOME/alot/themes"
 
 
 .. _thread-authors-me:
@@ -638,6 +678,28 @@
     :default: True
 
 
+.. _thread-focus-linewise:
+
+.. describe:: thread_focus_linewise
+
+     Split message body linewise and allows to (move) the focus to each individual
+     line. Setting this to False will result in one potentially big text widget
+     for the whole message body.
+
+    :type: boolean
+    :default: True
+
+
+.. _thread-indent-replies:
+
+.. describe:: thread_indent_replies
+
+     number of characters used to indent replies relative to original messages in thread mode
+
+    :type: integer
+    :default: 2
+
+
 .. _thread-statusbar:
 
 .. describe:: thread_statusbar
@@ -651,6 +713,8 @@
      * `{subject}`: subject line of the thread
      * `{authors}`: abbreviated authors string for this thread
      * `{message_count}`: number of contained messages
+     * `{thread_tags}`: displays all tags present in the current thread.
+     * `{intersection_tags}`: displays tags common to all messages in the current thread.
 
     :type: mixed_list
     :default: [{buffer_no}: thread] {subject}, {input_queue} total messages: {total_messages}

@@ -1,20 +1,20 @@
 # Copyright (C) 2011-2012  Patrick Totzke <patricktotzke@gmail.com>
+# Copyright © 2018 Dylan Baker
 # This file is released under the GNU GPL, version 3 or a later revision.
 # For further details see the COPYING file
-from __future__ import absolute_import
-
 import argparse
 import logging
 import mailcap
 import os
-import re
 import subprocess
 import tempfile
-from email.utils import getaddresses, parseaddr, formataddr
+import email
+import email.policy
+from email.utils import getaddresses, parseaddr
 from email.message import Message
 
-from twisted.internet.defer import inlineCallbacks
-from cStringIO import StringIO
+import urwid
+from io import BytesIO
 
 from . import Command, registerCommand
 from .globals import ExternalCommand
@@ -22,19 +22,22 @@ from .globals import FlushCommand
 from .globals import ComposeCommand
 from .globals import MoveCommand
 from .globals import CommandCanceled
+from .common import RetagPromptCommand
 from .envelope import SendCommand
-from ..completion import ContactsCompleter, PathCompleter
+from ..completion.contacts import ContactsCompleter
+from ..completion.path import PathCompleter
 from ..db.utils import decode_header
-from ..db.utils import encode_header
+from ..db.utils import formataddr
 from ..db.utils import extract_headers
 from ..db.utils import extract_body
+from ..db.utils import clear_my_address
+from ..db.utils import ensure_unique_address
 from ..db.envelope import Envelope
 from ..db.attachment import Attachment
 from ..db.errors import DatabaseROError
-from ..settings import settings
+from ..settings.const import settings
 from ..helper import parse_mailcap_nametemplate
 from ..helper import split_commandstring
-from ..helper import email_as_string
 from ..utils import argparse as cargparse
 from ..widgets.globals import AttachmentWidget
 
@@ -52,8 +55,6 @@ def determine_sender(mail, action='reply'):
     :type action: str
     """
     assert action in ['reply', 'forward', 'bounce']
-    realname = None
-    address = None
 
     # get accounts
     my_accounts = settings.get_accounts()
@@ -67,42 +68,37 @@ def determine_sender(mail, action='reply'):
     # account X is the one selected and not account Y.
     candidate_headers = settings.get("reply_account_header_priority")
     for candidate_header in candidate_headers:
-        if realname is not None:
-            break
         candidate_addresses = getaddresses(mail.get_all(candidate_header, []))
 
         logging.debug('candidate addresses: %s', candidate_addresses)
         # pick the most important account that has an address in candidates
-        # and use that accounts realname and the address found here
+        # and use that account's realname and the address found here
         for account in my_accounts:
-            acc_addresses = [re.escape(a) for a in account.get_addresses()]
-            if account.alias_regexp is not None:
-                acc_addresses.append(account.alias_regexp)
-            for alias in acc_addresses:
-                if realname is not None:
-                    break
-                regex = re.compile('^' + alias + '$', flags=re.IGNORECASE)
-                for seen_name, seen_address in candidate_addresses:
-                    if regex.match(seen_address):
-                        logging.debug("match!: '%s' '%s'", seen_address, alias)
-                        if settings.get(action + '_force_realname'):
-                            realname = account.realname
-                        else:
-                            realname = seen_name
-                        if settings.get(action + '_force_address'):
-                            address = account.address
-                        else:
-                            address = seen_address
+            for seen_name, seen_address in candidate_addresses:
+                if account.matches_address(seen_address):
+                    if settings.get(action + '_force_realname'):
+                        realname = account.realname
+                    else:
+                        realname = seen_name
+                    if settings.get(action + '_force_address'):
+                        address = str(account.address)
+                    else:
+                        address = seen_address
+
+                    logging.debug('using realname: "%s"', realname)
+                    logging.debug('using address: %s', address)
+
+                    from_value = formataddr((realname, address))
+                    return from_value, account
 
     # revert to default account if nothing found
-    if realname is None:
-        account = my_accounts[0]
-        realname = account.realname
-        address = account.address
+    account = my_accounts[0]
+    realname = account.realname
+    address = account.address
     logging.debug('using realname: "%s"', realname)
     logging.debug('using address: %s', address)
 
-    from_value = formataddr((realname, address))
+    from_value = formataddr((realname, str(address)))
     return from_value, account
 
 
@@ -136,30 +132,31 @@ class ReplyCommand(Command):
         self.force_spawn = spawn
         Command.__init__(self, **kwargs)
 
-    def apply(self, ui):
+    async def apply(self, ui):
         # get message to reply to if not given in constructor
         if not self.message:
             self.message = ui.current_buffer.get_selected_message()
         mail = self.message.get_email()
 
         # set body text
-        name, address = self.message.get_author()
+        name, address = parseaddr(mail['From'])
         timestamp = self.message.get_date()
         qf = settings.get_hook('reply_prefix')
         if qf:
-            quotestring = qf(name, address, timestamp, ui=ui, dbm=ui.dbman)
+            quotestring = qf(name, address, timestamp,
+                             message=mail, ui=ui, dbm=ui.dbman)
         else:
             quotestring = 'Quoting %s (%s)\n' % (name or address, timestamp)
         mailcontent = quotestring
         quotehook = settings.get_hook('text_quote')
         if quotehook:
-            mailcontent += quotehook(self.message.accumulate_body())
+            mailcontent += quotehook(self.message.get_body_text())
         else:
             quote_prefix = settings.get('quote_prefix')
-            for line in self.message.accumulate_body().splitlines():
+            for line in self.message.get_body_text().splitlines():
                 mailcontent += quote_prefix + line + '\n'
 
-        envelope = Envelope(bodytext=mailcontent)
+        envelope = Envelope(bodytext=mailcontent, replied=self.message)
 
         # copy subject
         subject = decode_header(mail.get('Subject', ''))
@@ -185,32 +182,32 @@ class ReplyCommand(Command):
 
         # set From-header and sending account
         try:
-            from_header, _ = determine_sender(mail, 'reply')
+            from_header, account = determine_sender(mail, 'reply')
         except AssertionError as e:
-            ui.notify(e.message, priority='error')
+            ui.notify(str(e), priority='error')
             return
         envelope.add('From', from_header)
+        envelope.account = account
 
         # set To
         sender = mail['Reply-To'] or mail['From']
-        my_addresses = settings.get_addresses()
         sender_address = parseaddr(sender)[1]
         cc = []
 
         # check if reply is to self sent message
-        if sender_address in my_addresses:
+        if account.matches_address(sender_address):
             recipients = mail.get_all('To', [])
             emsg = 'Replying to own message, set recipients to: %s' \
                 % recipients
             logging.debug(emsg)
         else:
-            recipients = self.clear_my_address([], [sender])
+            recipients = [sender]
 
         if self.groupreply:
             # make sure that our own address is not included
             # if the message was self-sent, then our address is not included
             MFT = mail.get_all('Mail-Followup-To', [])
-            followupto = self.clear_my_address(my_addresses, MFT)
+            followupto = clear_my_address(account, MFT)
             if followupto and settings.get('honor_followup_to'):
                 logging.debug('honor followup to: %s', ', '.join(followupto))
                 recipients = followupto
@@ -220,18 +217,17 @@ class ReplyCommand(Command):
                     recipients.append(mail['From'])
 
                 # append To addresses if not replying to self sent message
-                if sender_address not in my_addresses:
-                    cleared = self.clear_my_address(
-                        my_addresses, mail.get_all('To', []))
+                if not account.matches_address(sender_address):
+                    cleared = clear_my_address(account,
+                                               mail.get_all('To', []))
                     recipients.extend(cleared)
 
                 # copy cc for group-replies
                 if 'Cc' in mail:
-                    cc = self.clear_my_address(
-                        my_addresses, mail.get_all('Cc', []))
+                    cc = clear_my_address(account, mail.get_all('Cc', []))
                     envelope.add('Cc', decode_header(', '.join(cc)))
 
-        to = ', '.join(self.ensure_unique_address(recipients))
+        to = ', '.join(ensure_unique_address(recipients))
         logging.debug('reply to: %s', to)
 
         if self.listreply:
@@ -240,6 +236,7 @@ class ReplyCommand(Command):
             # X-BeenThere is needed by sourceforge ML also winehq
             # X-Mailing-List is also standart and is used by git-send-mail
             to = mail['Reply-To'] or mail['X-BeenThere'] or mail['X-Mailing-List']
+
             # Some mail server (gmail) will not resend you own mail, so you
             # have to deal with the one in sent
             if to is None:
@@ -281,39 +278,9 @@ class ReplyCommand(Command):
 
         # continue to compose
         encrypt = mail.get_content_subtype() == 'encrypted'
-        ui.apply_command(ComposeCommand(envelope=envelope,
-                                        spawn=self.force_spawn,
-                                        encrypt=encrypt))
-
-    @staticmethod
-    def clear_my_address(my_addresses, value):
-        """return recipient header without the addresses in my_addresses
-
-        :param my_addresses: a list of my email addresses (no real name part)
-        :type my_addresses: list(str)
-        :param value: a list of recipient or sender strings (with or without
-            real names as taken from email headers)
-        :type value: list(str)
-        :returns: a new, potentially shortend list
-        :rtype: list(str)
-        """
-        new_value = []
-        for name, address in getaddresses(value):
-            if address not in my_addresses:
-                new_value.append(formataddr((name, address)))
-        return new_value
-
-    @staticmethod
-    def ensure_unique_address(recipients):
-        """
-        clean up a list of name,address pairs so that
-        no address appears multiple times.
-        """
-        res = dict()
-        for name, address in getaddresses(recipients):
-            res[address] = name
-        urecipients = [formataddr((n, a)) for a, n in res.iteritems()]
-        return sorted(urecipients)
+        await ui.apply_command(ComposeCommand(envelope=envelope,
+                                              spawn=self.force_spawn,
+                                              encrypt=encrypt))
 
 
 @registerCommand(MODE, 'forward', arguments=[
@@ -339,13 +306,13 @@ class ForwardCommand(Command):
         self.force_spawn = spawn
         Command.__init__(self, **kwargs)
 
-    def apply(self, ui):
+    async def apply(self, ui):
         # get message to forward if not given in constructor
         if not self.message:
             self.message = ui.current_buffer.get_selected_message()
         mail = self.message.get_email()
 
-        envelope = Envelope()
+        envelope = Envelope(passed=self.message)
 
         if self.inline:  # inline mode
             # set body text
@@ -353,17 +320,18 @@ class ForwardCommand(Command):
             timestamp = self.message.get_date()
             qf = settings.get_hook('forward_prefix')
             if qf:
-                quote = qf(name, address, timestamp, ui=ui, dbm=ui.dbman)
+                quote = qf(name, address, timestamp,
+                           message=mail, ui=ui, dbm=ui.dbman)
             else:
                 quote = 'Forwarded message from %s (%s):\n' % (
                     name or address, timestamp)
             mailcontent = quote
             quotehook = settings.get_hook('text_quote')
             if quotehook:
-                mailcontent += quotehook(self.message.accumulate_body())
+                mailcontent += quotehook(self.message.get_body_text())
             else:
                 quote_prefix = settings.get('quote_prefix')
-                for line in self.message.accumulate_body().splitlines():
+                for line in self.message.get_body_text().splitlines():
                     mailcontent += quote_prefix + line + '\n'
 
             envelope.body = mailcontent
@@ -376,7 +344,7 @@ class ForwardCommand(Command):
             original_mail = Message()
             original_mail.set_type('message/rfc822')
             original_mail['Content-Disposition'] = 'attachment'
-            original_mail.set_payload(email_as_string(mail))
+            original_mail.set_payload(mail.as_string(policy=email.policy.SMTP))
             envelope.attach(Attachment(original_mail))
 
         # copy subject
@@ -393,15 +361,16 @@ class ForwardCommand(Command):
 
         # set From-header and sending account
         try:
-            from_header, _ = determine_sender(mail, 'reply')
+            from_header, account = determine_sender(mail, 'reply')
         except AssertionError as e:
-            ui.notify(e.message, priority='error')
+            ui.notify(str(e), priority='error')
             return
         envelope.add('From', from_header)
+        envelope.account = account
 
         # continue to compose
-        ui.apply_command(ComposeCommand(envelope=envelope,
-                                        spawn=self.force_spawn))
+        await ui.apply_command(ComposeCommand(envelope=envelope,
+                                              spawn=self.force_spawn))
 
 
 @registerCommand(MODE, 'bounce')
@@ -418,8 +387,7 @@ class BounceMailCommand(Command):
         self.message = message
         Command.__init__(self, **kwargs)
 
-    @inlineCallbacks
-    def apply(self, ui):
+    async def apply(self, ui):
         # get mail to bounce
         if not self.message:
             self.message = ui.current_buffer.get_selected_message()
@@ -442,7 +410,7 @@ class BounceMailCommand(Command):
         try:
             resent_from_header, account = determine_sender(mail, 'bounce')
         except AssertionError as e:
-            ui.notify(e.message, priority='error')
+            ui.notify(str(e), priority='error')
             return
         mail['Resent-From'] = resent_from_header
 
@@ -456,7 +424,7 @@ class BounceMailCommand(Command):
             completer = ContactsCompleter(abooks)
         else:
             completer = None
-        to = yield ui.prompt('To', completer=completer,
+        to = await ui.prompt('To', completer=completer,
                              history=ui.recipienthistory)
         if to is None:
             raise CommandCanceled()
@@ -466,7 +434,7 @@ class BounceMailCommand(Command):
         logging.debug("bouncing mail")
         logging.debug(mail.__class__)
 
-        ui.apply_command(SendCommand(mail=mail))
+        await ui.apply_command(SendCommand(mail=mail))
 
 
 @registerCommand(MODE, 'editnew', arguments=[
@@ -486,13 +454,18 @@ class EditNewCommand(Command):
         self.force_spawn = spawn
         Command.__init__(self, **kwargs)
 
-    def apply(self, ui):
+    async def apply(self, ui):
         if not self.message:
             self.message = ui.current_buffer.get_selected_message()
         mail = self.message.get_email()
+        # copy most tags to the envelope
+        tags = set(self.message.get_tags())
+        tags.difference_update({'inbox', 'sent', 'draft', 'killed', 'replied',
+                                'signed', 'encrypted', 'unread', 'attachment'})
+        tags = list(tags)
         # set body text
-        mailcontent = self.message.accumulate_body()
-        envelope = Envelope(bodytext=mailcontent)
+        mailcontent = self.message.get_body_text()
+        envelope = Envelope(bodytext=mailcontent, tags=tags)
 
         # copy selected headers
         to_copy = ['Subject', 'From', 'To', 'Cc', 'Bcc', 'In-Reply-To',
@@ -506,40 +479,40 @@ class EditNewCommand(Command):
         for b in self.message.get_attachments():
             envelope.attach(b)
 
-        ui.apply_command(ComposeCommand(envelope=envelope,
-                                        spawn=self.force_spawn,
-                                        omit_signature=True))
+        await ui.apply_command(ComposeCommand(envelope=envelope,
+                                              spawn=self.force_spawn,
+                                              omit_signature=True))
 
 
 @registerCommand(
-    MODE, 'fold', forced={'visible': False},
-    arguments=[
-        (['query'], {'help': 'query used to filter messages to affect',
-                     'nargs': '*'})
-    ],
-    help='fold message(s)')
-@registerCommand(MODE, 'unfold', forced={'visible': True}, arguments=[
-    (['query'], {'help': 'query used to filter messages to affect',
-                 'nargs': '*'}),
-], help='unfold message(s)')
-@registerCommand(MODE, 'togglesource', forced={'raw': 'toggle'}, arguments=[
-    (['query'], {'help': 'query used to filter messages to affect',
-                 'nargs': '*'}),
-], help='display message source')
-@registerCommand(MODE, 'toggleheaders', forced={'all_headers': 'toggle'},
-                 arguments=[
-                     (['query'], {
-                         'help': 'query used to filter messages to affect',
-                         'nargs': '*'}),
-                 ],
-                 help='display all headers')
+    MODE, 'fold', help='fold message(s)', forced={'visible': False},
+    arguments=[(['query'], {'help': 'query used to filter messages to affect',
+                            'nargs': '*'})])
+@registerCommand(
+    MODE, 'unfold', help='unfold message(s)', forced={'visible': True},
+    arguments=[(['query'], {'help': 'query used to filter messages to affect',
+                            'nargs': '*'})])
+@registerCommand(
+    MODE, 'togglesource', help='display message source',
+    forced={'raw': 'toggle'},
+    arguments=[(['query'], {'help': 'query used to filter messages to affect',
+                            'nargs': '*'})])
+@registerCommand(
+    MODE, 'toggleheaders', help='display all headers',
+    forced={'all_headers': 'toggle'},
+    arguments=[(['query'], {'help': 'query used to filter messages to affect',
+                            'nargs': '*'})])
+@registerCommand(
+    MODE, 'indent', help='change message/reply indentation',
+    arguments=[(['indent'], {'action': cargparse.ValidatedStoreAction,
+                             'validator': cargparse.is_int_or_pm})])
 class ChangeDisplaymodeCommand(Command):
 
     """fold or unfold messages"""
     repeatable = True
 
     def __init__(self, query=None, visible=None, raw=None, all_headers=None,
-                 **kwargs):
+                 indent=None, **kwargs):
         """
         :param query: notmuch query string used to filter messages to affect
         :type query: str
@@ -549,6 +522,8 @@ class ChangeDisplaymodeCommand(Command):
         :type raw: True, False, 'toggle' or None
         :param all_headers: show all headers (only visible if not in raw mode)
         :type all_headers: True, False, 'toggle' or None
+        :param indent: message/reply indentation
+        :type indent: '+', '-', or int
         """
         self.query = None
         if query:
@@ -556,10 +531,28 @@ class ChangeDisplaymodeCommand(Command):
         self.visible = visible
         self.raw = raw
         self.all_headers = all_headers
+        self.indent = indent
         Command.__init__(self, **kwargs)
 
     def apply(self, ui):
         tbuffer = ui.current_buffer
+
+        # set message/reply indentation if changed
+        if self.indent is not None:
+            if self.indent == '+':
+                newindent = tbuffer._indent_width + 1
+            elif self.indent == '-':
+                newindent = tbuffer._indent_width - 1
+            else:
+                # argparse validation guarantees that self.indent
+                # can be cast to an integer
+                newindent = int(self.indent)
+            # make sure indent remains non-negative
+            tbuffer._indent_width = max(newindent, 0)
+            tbuffer.rebuild()
+            tbuffer.collapse_all()
+            ui.update()
+
         logging.debug('matching lines %s...', self.query)
         if self.query is None:
             messagetrees = [tbuffer.get_selected_messagetree()]
@@ -618,8 +611,6 @@ class ChangeDisplaymodeCommand(Command):
                    'help': 'let the shell interpret the command'}),
     (['--notify_stdout'], {'action': 'store_true',
                            'help': 'display cmd\'s stdout as notification'}),
-    (['--field_key'], {'help': 'mailcap field key for decoding',
-                       'default': 'copiousoutput'}),
 ])
 class PipeCommand(Command):
 
@@ -629,8 +620,7 @@ class PipeCommand(Command):
     def __init__(self, cmd, all=False, separately=False, background=False,
                  shell=False, notify_stdout=False, format='raw',
                  add_tags=False, noop_msg='no command specified',
-                 confirm_msg='', done_msg=None, field_key='copiousoutput',
-                 **kwargs):
+                 confirm_msg='', done_msg=None, **kwargs):
         """
         :param cmd: shellcommand to open
         :type cmd: str or list of str
@@ -640,15 +630,15 @@ class PipeCommand(Command):
         :type separately: bool
         :param background: do not suspend the interface
         :type background: bool
-        :param notify_stdout: display command\'s stdout as notification message
-        :type notify_stdout: bool
         :param shell: let the shell interpret the command
         :type shell: bool
-
-                       'raw': message content as is,
-                       'decoded': message content, decoded quoted printable,
-                       'id': message ids, separated by newlines,
-                       'filepath': paths to message files on disk
+        :param notify_stdout: display command\'s stdout as notification message
+        :type notify_stdout: bool
+        :param format: what to pipe to the processes stdin. one of:
+            'raw': message content as is,
+            'decoded': message content, decoded quoted printable,
+            'id': message ids, separated by newlines,
+            'filepath': paths to message files on disk
         :type format: str
         :param add_tags: add 'Tags' header to the message
         :type add_tags: bool
@@ -659,11 +649,9 @@ class PipeCommand(Command):
         :type confirm_msg: str
         :param done_msg: notification message to show upon success
         :type done_msg: str
-        :param field_key: malcap field key for decoding
-        :type field_key: str
         """
         Command.__init__(self, **kwargs)
-        if isinstance(cmd, unicode):
+        if isinstance(cmd, str):
             cmd = split_commandstring(cmd)
         self.cmd = cmd
         self.whole_thread = all
@@ -676,10 +664,8 @@ class PipeCommand(Command):
         self.noop_msg = noop_msg
         self.confirm_msg = confirm_msg
         self.done_msg = done_msg
-        self.field_key = field_key
 
-    @inlineCallbacks
-    def apply(self, ui):
+    async def apply(self, ui):
         # abort if command unset
         if not self.cmd:
             ui.notify(self.noop_msg, priority='error')
@@ -696,7 +682,7 @@ class PipeCommand(Command):
 
         # ask for confirmation if needed
         if self.confirm_msg:
-            if (yield ui.choice(self.confirm_msg, select='yes',
+            if (await ui.choice(self.confirm_msg, select='yes',
                                 cancel='no')) == 'no':
                 return
 
@@ -716,45 +702,42 @@ class PipeCommand(Command):
             for msg in to_print:
                 mail = msg.get_email()
                 if self.add_tags:
-                    mail['Tags'] = encode_header('Tags',
-                                                 ', '.join(msg.get_tags()))
+                    mail.add_header('Tags', ', '.join(msg.get_tags()))
                 if self.output_format == 'raw':
                     pipestrings.append(mail.as_string())
                 elif self.output_format == 'decoded':
                     headertext = extract_headers(mail)
-                    bodytext = extract_body(mail, field_key=self.field_key)
+                    bodytext = extract_body(mail)
                     msgtext = '%s\n\n%s' % (headertext, bodytext)
-                    pipestrings.append(msgtext.encode('utf-8'))
+                    pipestrings.append(msgtext)
 
         if not self.separately:
             pipestrings = [separator.join(pipestrings)]
         if self.shell:
             self.cmd = [' '.join(self.cmd)]
 
-        # do teh monkey
+        # do the monkey
         for mail in pipestrings:
+            encoded_mail = mail.encode(urwid.util.detected_encoding)
             if self.background:
                 logging.debug('call in background: %s', self.cmd)
                 proc = subprocess.Popen(self.cmd,
                                         shell=True, stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE)
-                out, err = proc.communicate(mail)
+                out, err = proc.communicate(encoded_mail)
                 if self.notify_stdout:
                     ui.notify(out)
             else:
-                logging.debug('stop urwid screen')
-                ui.mainloop.screen.stop()
-                logging.debug('call: %s', self.cmd)
-                # if proc.stdout is defined later calls to communicate
-                # seem to be non-blocking!
-                proc = subprocess.Popen(self.cmd, shell=True,
-                                        stdin=subprocess.PIPE,
-                                        # stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE)
-                out, err = proc.communicate(mail)
-                logging.debug('start urwid screen')
-                ui.mainloop.screen.start()
+                with ui.paused():
+                    logging.debug('call: %s', self.cmd)
+                    # if proc.stdout is defined later calls to communicate
+                    # seem to be non-blocking!
+                    proc = subprocess.Popen(self.cmd, shell=True,
+                                            stdin=subprocess.PIPE,
+                                            # stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE)
+                    out, err = proc.communicate(encoded_mail)
             if err:
                 ui.notify(err, priority='error')
                 return
@@ -779,8 +762,7 @@ class RemoveCommand(Command):
         Command.__init__(self, **kwargs)
         self.all = all
 
-    @inlineCallbacks
-    def apply(self, ui):
+    async def apply(self, ui):
         threadbuffer = ui.current_buffer
         # get messages and notification strings
         if self.all:
@@ -796,7 +778,7 @@ class RemoveCommand(Command):
             ok_msg = 'removed message: %s' % msg.get_message_id()
 
         # ask for confirmation
-        if (yield ui.choice(confirm_msg, select='yes', cancel='no')) == 'no':
+        if (await ui.choice(confirm_msg, select='yes', cancel='no')) == 'no':
             return
 
         # notify callback
@@ -808,7 +790,7 @@ class RemoveCommand(Command):
         for m in messages:
             ui.dbman.remove_message(m, afterwards=callback)
 
-        ui.apply_command(FlushCommand())
+        await ui.apply_command(FlushCommand())
 
 
 @registerCommand(MODE, 'print', arguments=[
@@ -878,14 +860,13 @@ class SaveAttachmentCommand(Command):
         self.all = all
         self.path = path
 
-    @inlineCallbacks
-    def apply(self, ui):
+    async def apply(self, ui):
         pcomplete = PathCompleter()
         savedir = settings.get('attachment_prefix', '~')
         if self.all:
             msg = ui.current_buffer.get_selected_message()
             if not self.path:
-                self.path = yield ui.prompt('save attachments to',
+                self.path = await ui.prompt('save attachments to',
                                             text=os.path.join(savedir, ''),
                                             completer=pcomplete)
             if self.path:
@@ -910,7 +891,7 @@ class SaveAttachmentCommand(Command):
                 if not self.path:
                     msg = 'save attachment (%s) to ' % filename
                     initialtext = os.path.join(savedir, filename)
-                    self.path = yield ui.prompt(msg,
+                    self.path = await ui.prompt(msg,
                                                 completer=pcomplete,
                                                 text=initialtext)
                 if self.path:
@@ -934,7 +915,7 @@ class OpenAttachmentCommand(Command):
         Command.__init__(self, **kwargs)
         self.attachment = attachment
 
-    def apply(self, ui):
+    async def apply(self, ui):
         logging.info('open attachment')
         mimetype = self.attachment.get_content_type()
 
@@ -970,7 +951,7 @@ class OpenAttachmentCommand(Command):
                 def afterwards():
                     os.unlink(tempfile_name)
             else:
-                handler_stdin = StringIO()
+                handler_stdin = BytesIO()
                 self.attachment.write(handler_stdin)
 
             # create handler command list
@@ -983,10 +964,10 @@ class OpenAttachmentCommand(Command):
             # XXX: could this be repalced with "'needsterminal' not in entry"?
             overtakes = entry.get('needsterminal') is None
 
-            ui.apply_command(ExternalCommand(handler_cmdlist,
-                                             stdin=handler_stdin,
-                                             on_success=afterwards,
-                                             thread=overtakes))
+            await ui.apply_command(ExternalCommand(handler_cmdlist,
+                                                   stdin=handler_stdin,
+                                                   on_success=afterwards,
+                                                   thread=overtakes))
         else:
             ui.notify('unknown mime type')
 
@@ -996,7 +977,11 @@ class OpenAttachmentCommand(Command):
     arguments=[
         (['movement'],
          {'nargs': argparse.REMAINDER,
-          'help': 'up, down, page up, page down, first, last'})])
+          'help': '''up, down, [half]page up, [half]page down, first, last, \
+                  parent, first reply, last reply, \
+                  next sibling, previous sibling, next, previous, \
+                  next unfolded, previous unfolded, \
+                  next NOTMUCH_QUERY, previous NOTMUCH_QUERY'''})])
 class MoveFocusCommand(MoveCommand):
 
     def apply(self, ui):
@@ -1020,26 +1005,34 @@ class MoveFocusCommand(MoveCommand):
             tbuffer.focus_next_unfolded()
         elif self.movement == 'previous unfolded':
             tbuffer.focus_prev_unfolded()
+        elif self.movement.startswith('next '):
+            query = self.movement[5:].strip()
+            tbuffer.focus_next_matching(query)
+        elif self.movement.startswith('previous '):
+            query = self.movement[9:].strip()
+            tbuffer.focus_prev_matching(query)
         else:
             MoveCommand.apply(self, ui)
         # TODO add 'next matching' if threadbuffer stores the original query
         # TODO: add next by date..
-        tbuffer.body.refresh()
 
 
 @registerCommand(MODE, 'select')
 class ThreadSelectCommand(Command):
 
-    """select focussed element. The fired action depends on the focus:
-        - if message summary, this toggles visibility of the message,
-        - if attachment line, this opens the attachment"""
-    def apply(self, ui):
+    """select focussed element:
+        - if it is a message summary, toggle visibility of the message;
+        - if it is an attachment line, open the attachment"""
+    async def apply(self, ui):
         focus = ui.get_deep_focus()
         if isinstance(focus, AttachmentWidget):
             logging.info('open attachment')
-            ui.apply_command(OpenAttachmentCommand(focus.get_attachment()))
+            await ui.apply_command(OpenAttachmentCommand(focus.get_attachment()))
         else:
-            ui.apply_command(ChangeDisplaymodeCommand(visible='toggle'))
+            await ui.apply_command(ChangeDisplaymodeCommand(visible='toggle'))
+
+
+RetagPromptCommand = registerCommand(MODE, 'retagprompt')(RetagPromptCommand)
 
 
 @registerCommand(
@@ -1087,7 +1080,7 @@ class TagCommand(Command):
     """manipulate message tags"""
     repeatable = True
 
-    def __init__(self, tags=u'', action='add', all=False, flush=True,
+    def __init__(self, tags='', action='add', all=False, flush=True,
                  **kwargs):
         """
         :param tags: comma separated list of tagstrings to set
@@ -1098,7 +1091,7 @@ class TagCommand(Command):
         :type action: str
         :param all: tag all messages in thread
         :type all: bool
-        :param flush: imediately write out to the index
+        :param flush: immediately write out to the index
         :type flush: bool
         """
         self.tagsstring = tags
@@ -1107,7 +1100,7 @@ class TagCommand(Command):
         self.flush = flush
         Command.__init__(self, **kwargs)
 
-    def apply(self, ui):
+    async def apply(self, ui):
         tbuffer = ui.current_buffer
         if self.all:
             messagetrees = tbuffer.messagetrees()
@@ -1155,4 +1148,4 @@ class TagCommand(Command):
 
         # flush index
         if self.flush:
-            ui.apply_command(FlushCommand())
+            await ui.apply_command(FlushCommand())

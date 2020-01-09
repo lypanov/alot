@@ -16,13 +16,17 @@ input_timeout = float(default=1.0)
 # display background colors set by ANSI character escapes
 interpret_ansi_background = boolean(default=True)
 
+# A list of tags that will be excluded from search results by default. Using an excluded tag in a query will override that exclusion.
+# .. note:: this config setting is equivalent to, but independent of, the 'search.exclude_tags' in the notmuch config.
+exclude_tags = force_list(default=list())
+
 # confirm exit
 bug_on_exit = boolean(default=False)
 
 # offset of next focused buffer if the current one gets closed
 bufferclose_focus_offset = integer(default=-1)
 
-# number of colours to use
+# number of colours to use on the terminal
 colourmode = option(1, 16, 256, default=256)
 
 # number of spaces used to replace tab characters
@@ -32,13 +36,18 @@ tabwidth = integer(default=8)
 # It will be used if you give `compose --template` a filename without a path prefix.
 template_dir = string(default='$XDG_CONFIG_HOME/alot/templates')
 
-# directory containing theme files
-themes_dir = string(default=None)
+# directory containing theme files.
+themes_dir = string(default='$XDG_CONFIG_HOME/alot/themes')
 
 # name of the theme to use
 theme = string(default=None)
 
 # enable mouse support - mouse tracking will be handled by urwid
+#
+# .. note:: If this is set to True mouse events are passed from the terminal
+#           to urwid/alot.  This means that normal text selection in alot will
+#           not be possible.  Most terminal emulators will still allow you to
+#           select text when shift is pressed.
 handle_mouse = boolean(default=False)
 
 # headers that get displayed by default
@@ -68,6 +77,9 @@ thread_subject = option('oldest', 'notmuch', default='notmuch')
 # author's first or latest message in thread
 thread_authors_order_by = option('first_message', 'latest_message', default='first_message')
 
+# number of characters used to indent replies relative to original messages in thread mode 
+thread_indent_replies = integer(default=2)
+
 # set terminal command used for spawning shell commands
 terminal_cmd = string(default='x-terminal-emulator -e')
 
@@ -78,7 +90,7 @@ editor_cmd = string(default=None)
 # file encoding used by your editor
 editor_writes_encoding = string(default='UTF-8')
 
-# use terminal_command to spawn a new terminal for the editor?
+# use :ref:`terminal_cmd <terminal-cmd>` to spawn a new terminal for the editor?
 # equivalent to always providing the `--spawn=yes` parameter to compose/edit commands
 editor_spawn = boolean(default=False)
 
@@ -135,6 +147,9 @@ search_statusbar = mixed_list(string, string, default=list('[{buffer_no}: search
 # * `{subject}`: subject line of the thread
 # * `{authors}`: abbreviated authors string for this thread
 # * `{message_count}`: number of contained messages
+# * `{thread_tags}`: displays all tags present in the current thread.
+# * `{intersection_tags}`: displays tags common to all messages in the current thread.
+
 thread_statusbar = mixed_list(string, string, default=list('[{buffer_no}: thread] {subject}','{input_queue} total messages: {total_messages}'))
 
 # Format of the status-bar in taglist mode.
@@ -142,6 +157,12 @@ thread_statusbar = mixed_list(string, string, default=list('[{buffer_no}: thread
 # These strings may contain variables listed at :ref:`bufferlist_statusbar <bufferlist-statusbar>`
 # that will be substituted accordingly.
 taglist_statusbar = mixed_list(string, string, default=list('[{buffer_no}: taglist]','{input_queue} total messages: {total_messages}'))
+
+# Format of the status-bar in named query list mode.
+# This is a pair of strings to be left and right aligned in the status-bar.
+# These strings may contain variables listed at :ref:`bufferlist_statusbar <bufferlist-statusbar>`
+# that will be substituted accordingly.
+namedqueries_statusbar = mixed_list(string, string, default=list('[{buffer_no}: namedqueries]','{query_count} named queries'))
 
 # Format of the status-bar in envelope mode.
 # This is a pair of strings to be left and right aligned in the status-bar.
@@ -178,6 +199,10 @@ quit_on_last_bclose = boolean(default=False)
 # setting this to the empty string will cause alot to omit the header all together.
 # The string '{version}' will be replaced by the version string of the running instance.
 user_agent = string(default='alot/{version}')
+
+# Domain to use in automatically generated Message-ID headers.
+# The default is the local hostname.
+message_id_domain = string(default=None)
 
 # Suffix of the prompt used when waiting for user input
 prompt_suffix = string(default=':')
@@ -254,6 +279,12 @@ history_size = integer(default=50)
 # The number of seconds to wait between calls to the loop_hook
 periodic_hook_frequency = integer(default=300)
 
+# Split message body linewise and allows to (move) the focus to each individual
+# line. Setting this to False will result in one potentially big text widget
+# for the whole message body.
+thread_focus_linewise = boolean(default=True)
+
+
 # Key bindings
 [bindings]
     __many__ = string(default=None)
@@ -291,14 +322,14 @@ periodic_hook_frequency = integer(default=300)
         # sendmail command. This is the shell command used to send out mails via the sendmail protocol
         sendmail_command = string(default='sendmail -t')
 
-        # where to store outgoing mails, e.g. `maildir:///home/you/mail/Sent`.
+        # where to store outgoing mails, e.g. `maildir:///home/you/mail/Sent` or `maildir://~/mail/Sent`.
         # You can use mbox, maildir, mh, babyl and mmdf in the protocol part of the URL.
         #
         # .. note:: If you want to add outgoing mails automatically to the notmuch index
         #           you must use maildir in a path within your notmuch database path.
         sent_box = mail_container(default=None)
 
-        # where to store draft mails, e.g. `maildir:///home/you/mail/Drafts`.
+        # where to store draft mails, e.g. `maildir:///home/you/mail/Drafts` or `maildir://~/mail/Drafts`.
         # You can use mbox, maildir, mh, babyl and mmdf in the protocol part of the URL.
         #
         # .. note:: You will most likely want drafts indexed by notmuch to be able to
@@ -307,7 +338,16 @@ periodic_hook_frequency = integer(default=300)
         draft_box = mail_container(default=None)
 
         # list of tags to automatically add to outgoing messages
-        sent_tags = force_list(default=list('sent'))
+        sent_tags = force_list(default='sent')
+
+        # list of tags to automatically add to draft messages
+        draft_tags = force_list(default='draft')
+
+        # list of tags to automatically add to replied messages
+        replied_tags = force_list(default='replied')
+
+        # list of tags to automatically add to passed messages
+        passed_tags = force_list(default='passed')
 
         # path to signature file that gets attached to all outgoing mails from this account, optionally
         # renamed to :ref:`signature_filename <signature-filename>`.
@@ -324,28 +364,43 @@ periodic_hook_frequency = integer(default=300)
         # Outgoing messages will be GPG signed by default if this is set to True.
         sign_by_default = boolean(default=False)
 
-	# Alot will try to GPG encrypt outgoing messages by default when this
-	# is set to `all` or `trusted`.  If set to `all` the message will be
-	# encrypted for all recipients for who a key is available in the key
-	# ring.  If set to `trusted` it will be encrypted to all
-	# recipients if a trusted key is available for all recipients (one
-	# where the user id for the key is signed with a trusted signature).
-	#
-	# .. note:: If the message will not be encrypted by default you can
-	#           still use the :ref:`toggleencrypt
-	#           <cmd.envelope.toggleencrypt>`, :ref:`encrypt
-	#           <cmd.envelope.encrypt>` and :ref:`unencrypt
-	#           <cmd.envelope.unencrypt>` commands to encrypt it.
-	# .. note:: The values `True` and `False` are interpreted as `all` and
-	#           `none` respectively.  They are kept for backwards
-	#           compatibility to give users a change to migrate to the new
-	#           option type.  They might become deprecated in future
-	#           versions.
+        # Alot will try to GPG encrypt outgoing messages by default when this
+        # is set to `all` or `trusted`.  If set to `all` the message will be
+        # encrypted for all recipients for who a key is available in the key
+        # ring.  If set to `trusted` it will be encrypted to all
+        # recipients if a trusted key is available for all recipients (one
+        # where the user id for the key is signed with a trusted signature).
+        #
+        # .. note:: If the message will not be encrypted by default you can
+        #           still use the :ref:`toggleencrypt
+        #           <cmd.envelope.toggleencrypt>`, :ref:`encrypt
+        #           <cmd.envelope.encrypt>` and :ref:`unencrypt
+        #           <cmd.envelope.unencrypt>` commands to encrypt it.
+        # .. deprecated:: 0.4
+        #           The values `True` and `False` are interpreted as `all` and
+        #           `none` respectively. `0`, `1`, `true`, `True`, `false`,
+        #           `False`, `yes`, `Yes`, `no`, `No`, will be removed before
+        #           1.0, please move to `all`, `none`, or `trusted`.
         encrypt_by_default = option('all', 'none', 'trusted', 'True', 'False', 'true', 'false', 'Yes', 'No', 'yes', 'no', '1', '0', default='none')
 
-        # The GPG key ID you want to use with this account. If unset, alot will
-        # use your default key.
+        # If this is true when encrypting a message it will also be encrypted
+        # with the key defined for this account.
+        #
+        # .. warning::
+        #   
+        #    Before 0.6 this was controlled via gpg.conf.
+        encrypt_to_self = boolean(default=True)
+
+        # The GPG key ID you want to use with this account.
         gpg_key = gpg_key_hint(default=None)
+
+        # Whether the server treats the address as case-senstive or
+        # case-insensitve (True for the former, False for the latter)
+        #
+        # .. note:: The vast majority (if not all) SMTP servers in modern use
+        #           treat usernames as case insenstive, you should only set
+        #           this if you know that you need it.
+        case_sensitive_username = boolean(default=False)
 
         # address book for this account
         [[[abook]]]

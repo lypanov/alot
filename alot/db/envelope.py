@@ -1,35 +1,33 @@
 # Copyright (C) 2011-2012  Patrick Totzke <patricktotzke@gmail.com>
 # This file is released under the GNU GPL, version 3 or a later revision.
 # For further details see the COPYING file
-from __future__ import absolute_import
-
 import glob
 import logging
 import os
 import re
 import email
+import email.policy
 from email.encoders import encode_7or8bit
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 import email.charset as charset
-
-import gpgme
+import gpg
 
 from .attachment import Attachment
-from .utils import encode_header
 from .. import __version__
 from .. import helper
 from .. import crypto
-from ..settings import settings
+from ..settings.const import settings
 from ..errors import GPGProblem, GPGCode
 
 charset.add_charset('utf-8', charset.QP, charset.QP, 'utf-8')
 
 
-class Envelope(object):
+class Envelope:
+    """
+    a message that is not yet sent and still editable.
 
-    """a message that is not yet sent and still editable.
     It holds references to unencoded! body text and mail headers among other
     things.  Envelope implements the python container API for easy access of
     header values.  So `e['To']`, `e['To'] = 'foo@bar.baz'` and
@@ -48,10 +46,13 @@ class Envelope(object):
     """list of :class:`Attachments <alot.db.attachment.Attachment>`"""
     tags = []
     """tags to add after successful sendout"""
+    account = None
+    """account to send from"""
 
     def __init__(
             self, template=None, bodytext=None, headers=None, attachments=None,
-            sign=False, sign_key=None, encrypt=False, tags=None):
+            sign=False, sign_key=None, encrypt=False, tags=None, replied=None,
+            passed=None, account=None):
         """
         :param template: if not None, the envelope will be initialised by
                          :meth:`parsing <parse_template>` this string before
@@ -65,13 +66,19 @@ class Envelope(object):
         :type attachments: list of :class:`~alot.db.attachment.Attachment`
         :param tags: tags to add after successful sendout and saving this msg
         :type tags: list of str
+        :param replied: message being replied to
+        :type replied: :class:`~alot.db.message.Message`
+        :param passed: message being passed on
+        :type replied: :class:`~alot.db.message.Message`
+        :param account: account to send from
+        :type account: :class:`Account`
         """
         logging.debug('TEMPLATE: %s', template)
         if template:
             self.parse_template(template)
             logging.debug('PARSED TEMPLATE: %s', template)
             logging.debug('BODY: %s', self.body)
-        self.body = bodytext or u''
+        self.body = bodytext or ''
         # TODO: if this was as collections.defaultdict a number of methods
         # could be simplified.
         self.headers = headers or {}
@@ -81,16 +88,19 @@ class Envelope(object):
         self.encrypt = encrypt
         self.encrypt_keys = {}
         self.tags = tags or []  # tags to add after successful sendout
+        self.replied = replied  # message being replied to
+        self.passed = passed  # message being passed on
         self.sent_time = None
         self.modified_since_sent = False
         self.sending = False  # semaphore to avoid accidental double sendout
+        self.account = account
 
     def __str__(self):
         return "Envelope (%s)\n%s" % (self.headers, self.body)
 
     def __setitem__(self, name, val):
         """setter for header values. This allows adding header like so:
-        envelope['Subject'] = u'sm\xf8rebr\xf8d'
+        envelope['Subject'] = 'sm\xf8rebr\xf8d'
         """
         if name not in self.headers:
             self.headers[name] = []
@@ -156,7 +166,7 @@ class Envelope(object):
 
         if isinstance(attachment, Attachment):
             self.attachments.append(attachment)
-        elif isinstance(attachment, basestring):
+        elif isinstance(attachment, str):
             path = os.path.expanduser(attachment)
             part = helper.mimewrap(path, filename, ctype)
             self.attachments.append(Attachment(part))
@@ -187,18 +197,18 @@ class Envelope(object):
             inner_msg = textpart
 
         if self.sign:
-            plaintext = helper.email_as_string(inner_msg)
+            plaintext = inner_msg.as_bytes(policy=email.policy.SMTP)
             logging.debug('signing plaintext: %s', plaintext)
 
             try:
                 signatures, signature_str = crypto.detached_signature_for(
-                    plaintext, self.sign_key)
+                    plaintext, [self.sign_key])
                 if len(signatures) != 1:
                     raise GPGProblem("Could not sign message (GPGME "
                                      "did not return a signature)",
                                      code=GPGCode.KEY_CANNOT_SIGN)
-            except gpgme.GpgmeError as e:
-                if e.code == gpgme.ERR_BAD_PASSPHRASE:
+            except gpg.errors.GPGMEError as e:
+                if e.getcode() == gpg.errors.BAD_PASSPHRASE:
                     # If GPG_AGENT_INFO is unset or empty, the user just does
                     # not have gpg-agent running (properly).
                     if os.environ.get('GPG_AGENT_INFO', '').strip() == '':
@@ -217,9 +227,10 @@ class Envelope(object):
 
             # wrap signature in MIMEcontainter
             stype = 'pgp-signature; name="signature.asc"'
-            signature_mime = MIMEApplication(_data=signature_str,
-                                             _subtype=stype,
-                                             _encoder=encode_7or8bit)
+            signature_mime = MIMEApplication(
+                _data=signature_str.decode('ascii'),
+                _subtype=stype,
+                _encoder=encode_7or8bit)
             signature_mime['Content-Description'] = 'signature'
             signature_mime.set_charset('us-ascii')
 
@@ -231,13 +242,13 @@ class Envelope(object):
             unencrypted_msg = inner_msg
 
         if self.encrypt:
-            plaintext = helper.email_as_string(unencrypted_msg)
+            plaintext = unencrypted_msg.as_bytes(policy=email.policy.SMTP)
             logging.debug('encrypting plaintext: %s', plaintext)
 
             try:
-                encrypted_str = crypto.encrypt(plaintext,
-                                               self.encrypt_keys.values())
-            except gpgme.GpgmeError as e:
+                encrypted_str = crypto.encrypt(
+                    plaintext, list(self.encrypt_keys.values()))
+            except gpg.errors.GPGMEError as e:
                 raise GPGProblem(str(e), code=GPGCode.KEY_CANNOT_ENCRYPT)
 
             outer_msg = MIMEMultipart('encrypted',
@@ -249,9 +260,10 @@ class Envelope(object):
                                               _encoder=encode_7or8bit)
             encryption_mime.set_charset('us-ascii')
 
-            encrypted_mime = MIMEApplication(_data=encrypted_str,
-                                             _subtype='octet-stream',
-                                             _encoder=encode_7or8bit)
+            encrypted_mime = MIMEApplication(
+                _data=encrypted_str.decode('ascii'),
+                _subtype='octet-stream',
+                _encoder=encode_7or8bit)
             encrypted_mime.set_charset('us-ascii')
             outer_msg.attach(encryption_mime)
             outer_msg.attach(encrypted_mime)
@@ -260,9 +272,15 @@ class Envelope(object):
             outer_msg = unencrypted_msg
 
         headers = self.headers.copy()
+
+        # add Date header
+        if 'Date' not in headers:
+            headers['Date'] = [email.utils.formatdate(localtime=True)]
+
         # add Message-ID
         if 'Message-ID' not in headers:
-            headers['Message-ID'] = [email.Utils.make_msgid()]
+            domain = settings.get('message_id_domain')
+            headers['Message-ID'] = [email.utils.make_msgid(domain=domain)]
 
         if 'User-Agent' in headers:
             uastring_format = headers['User-Agent'][0]
@@ -273,56 +291,48 @@ class Envelope(object):
             headers['User-Agent'] = [uastring]
 
         # copy headers from envelope to mail
-        for k, vlist in headers.iteritems():
+        for k, vlist in headers.items():
             for v in vlist:
-                outer_msg[k] = encode_header(k, v)
+                outer_msg.add_header(k, v)
 
         return outer_msg
 
-    def parse_template(self, tmp, reset=False, only_body=False):
+    def parse_template(self, raw, reset=False, only_body=False):
         """parses a template or user edited string to fills this envelope.
 
-        :param tmp: the string to parse.
-        :type tmp: str
+        :param raw: the string to parse.
+        :type raw: str
         :param reset: remove previous envelope content
         :type reset: bool
+        :param only_body: do not parse headers
+        :type only_body: bool
         """
-        logging.debug('GoT: """\n%s\n"""', tmp)
+        logging.debug('GoT: """\n%s\n"""', raw)
 
         if self.sent_time:
             self.modified_since_sent = True
 
-        if only_body:
-            self.body = tmp
-        else:
-            m = re.match(r'(?P<h>([a-zA-Z0-9_-]+:.+\n)*)\n?(?P<b>(\s*.*)*)',
-                         tmp)
-            assert m
+        if reset:
+            self.headers = {}
 
-            d = m.groupdict()
-            headertext = d['h']
-            self.body = d['b']
-
-            # remove existing content
-            if reset:
-                self.headers = {}
-
+        headerEndPos = 0
+        if not only_body:
             # go through multiline, utf-8 encoded headers
+            # locally, lines are separated by a simple LF, not CRLF
             # we decode the edited text ourselves here as
             # email.message_from_file can't deal with raw utf8 header values
-            key = value = None
-            for line in headertext.splitlines():
-                if re.match('[a-zA-Z0-9_-]+:', line):  # new k/v pair
-                    if key and value:  # save old one from stack
-                        self.add(key, value)  # save
-                    key, value = line.strip().split(':', 1)  # parse new pair
-                    # strip spaces, otherwise we end up having " foo" as value
-                    # of "Subject: foo"
-                    value = value.strip()
-                elif key and value:  # append new line without key prefix
-                    value += line
-            if key and value:  # save last one if present
-                self.add(key, value)
+            headerRe = re.compile(r'^(?P<k>.+?):(?P<v>(.|\n[ \t\r\f\v])+)$',
+                                  re.MULTILINE)
+            for header in headerRe.finditer(raw):
+                if header.start() > headerEndPos + 1:
+                    break  # switched to body
+
+                key = header.group('k')
+                # simple unfolding as decribed in
+                # https://tools.ietf.org/html/rfc2822#section-2.2.3
+                unfoldedValue = header.group('v').replace('\n', '')
+                self.add(key, unfoldedValue.strip())
+                headerEndPos = header.end()
 
             # interpret 'Attach' pseudo header
             if 'Attach' in self:
@@ -335,3 +345,5 @@ class Envelope(object):
                 for path in to_attach:
                     self.attach(path)
                 del self['Attach']
+
+        self.body = raw[headerEndPos:].strip()

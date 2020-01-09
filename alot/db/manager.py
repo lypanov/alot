@@ -1,21 +1,13 @@
 # Copyright (C) 2011-2012  Patrick Totzke <patricktotzke@gmail.com>
+# Copyright © Dylan Baker
 # This file is released under the GNU GPL, version 3 or a later revision.
 # For further details see the COPYING file
-from __future__ import absolute_import
-
 from collections import deque
-import errno
 import logging
-import multiprocessing
-import os
-import signal
-import sys
 
 from notmuch import Database, NotmuchError, XapianError
 import notmuch
-from twisted.internet import reactor
 
-from . import DB_ENC
 from .errors import DatabaseError
 from .errors import DatabaseLockedError
 from .errors import DatabaseROError
@@ -23,52 +15,10 @@ from .errors import NonexistantObjectError
 from .message import Message
 from .thread import Thread
 from .utils import is_subdir_of
-from ..settings import settings
+from ..settings.const import settings
 
 
-class FillPipeProcess(multiprocessing.Process):
-
-    def __init__(self, it, stdout, stderr, pipe, fun=(lambda x: x)):
-        multiprocessing.Process.__init__(self)
-        self.it = it
-        self.pipe = pipe[1]
-        self.fun = fun
-        self.keep_going = True
-        self.stdout = stdout
-        self.stderr = stderr
-
-    def handle_sigterm(self, signo, frame):
-        # this is used to suppress any EINTR errors at interpreter
-        # shutdown
-        self.keep_going = False
-
-        # raises SystemExit to shut down the interpreter from the
-        # signal handler
-        sys.exit()
-
-    def run(self):
-        # replace filedescriptors 1 and 2 (stdout and stderr) with
-        # pipes to the parent process
-        os.dup2(self.stdout, 1)
-        os.dup2(self.stderr, 2)
-
-        # register a signal handler for SIGTERM
-        signal.signal(signal.SIGTERM, self.handle_sigterm)
-
-        for a in self.it:
-            try:
-                self.pipe.send(self.fun(a))
-            except IOError as e:
-                # suppress spurious EINTR errors at interpreter
-                # shutdown
-                if e.errno != errno.EINTR or self.keep_going:
-                    raise
-
-        self.pipe.close()
-
-
-class DBManager(object):
-
+class DBManager:
     """
     Keeps track of your index parameters, maintains a write-queue and
     lets you look up threads and messages directly to the persistent wrapper
@@ -125,7 +75,7 @@ class DBManager(object):
                     cmd, afterwards = current_item[:2]
                     logging.debug('cmd created')
 
-                    # aquire a writeable db handler
+                    # acquire a writeable db handler
                     try:
                         mode = Database.MODE.READ_WRITE
                         db = Database(path=self.path, mode=mode)
@@ -145,8 +95,7 @@ class DBManager(object):
                         msg.freeze()
                         logging.debug('freeze')
                         for tag in tags:
-                            msg.add_tag(tag.encode(DB_ENC),
-                                        sync_maildir_flags=sync)
+                            msg.add_tag(tag, sync_maildir_flags=sync)
                         logging.debug('added tags ')
                         msg.thaw()
                         logging.debug('thaw')
@@ -155,24 +104,25 @@ class DBManager(object):
                         path = current_item[2]
                         db.remove_message(path)
 
+                    elif cmd == 'setconfig':
+                        key = current_item[2]
+                        value = current_item[3]
+                        db.set_config(key, value)
+
                     else:  # tag/set/untag
                         querystring, tags = current_item[2:]
                         query = db.create_query(querystring)
                         for msg in query.search_messages():
                             msg.freeze()
                             if cmd == 'tag':
-                                for tag in tags:
-                                    msg.add_tag(tag.encode(DB_ENC),
-                                                sync_maildir_flags=sync)
+                                strategy = msg.add_tag
                             if cmd == 'set':
                                 msg.remove_all_tags()
-                                for tag in tags:
-                                    msg.add_tag(tag.encode(DB_ENC),
-                                                sync_maildir_flags=sync)
+                                strategy = msg.add_tag
                             elif cmd == 'untag':
-                                for tag in tags:
-                                    msg.remove_tag(tag.encode(DB_ENC),
-                                                   sync_maildir_flags=sync)
+                                strategy = msg.remove_tag
+                            for tag in tags:
+                                strategy(tag, sync_maildir_flags=sync)
                             msg.thaw()
 
                     logging.debug('ended atomic')
@@ -195,21 +145,12 @@ class DBManager(object):
                 except (XapianError, NotmuchError) as e:
                     logging.exception(e)
                     self.writequeue.appendleft(current_item)
-                    raise DatabaseError(unicode(e))
+                    raise DatabaseError(str(e))
                 except DatabaseLockedError as e:
                     logging.debug('index temporarily locked')
                     self.writequeue.appendleft(current_item)
                     raise e
                 logging.debug('flush finished')
-
-    def kill_search_processes(self):
-        """
-        terminate all search processes that originate from
-        this managers :meth:`get_threads`.
-        """
-        for p in self.processes:
-            p.terminate()
-        self.processes = []
 
     def tag(self, querystring, tags, afterwards=None, remove_rest=False):
         """
@@ -274,7 +215,7 @@ class DBManager(object):
         """returns :class:`notmuch.database.Thread` with given id"""
         query = self.query('thread:' + tid)
         try:
-            return query.search_threads().next()
+            return next(query.search_threads())
         except StopIteration:
             errmsg = 'no thread with id %s exists!' % tid
             raise NonexistantObjectError(errmsg)
@@ -305,70 +246,15 @@ class DBManager(object):
         db = Database(path=self.path)
         return [t for t in db.get_all_tags()]
 
-    def async(self, cbl, fun):
+    def get_named_queries(self):
         """
-        return a pair (pipe, process) so that the process writes
-        `fun(a)` to the pipe for each element `a` in the iterable returned
-        by the callable `cbl`.
-
-        :param cbl: a function returning something iterable
-        :type cbl: callable
-        :param fun: an unary translation function
-        :type fun: callable
-        :rtype: (:class:`multiprocessing.Pipe`,
-                :class:`multiprocessing.Process`)
+        returns the named queries stored in the database.
+        :rtype: dict (str -> str) mapping alias to full query string
         """
-        # create two unix pipes to redirect the workers stdout and
-        # stderr
-        stdout = os.pipe()
-        stderr = os.pipe()
+        db = Database(path=self.path)
+        return {k[6:]: v for k, v in db.get_configs('query.')}
 
-        # create a multiprocessing pipe for the results
-        pipe = multiprocessing.Pipe(False)
-        receiver, sender = pipe
-
-        process = FillPipeProcess(cbl(), stdout[1], stderr[1], pipe, fun)
-        process.start()
-        self.processes.append(process)
-        logging.debug('Worker process %s spawned', process.pid)
-
-        def threaded_wait():
-            # wait(2) for the process to die
-            process.join()
-
-            if process.exitcode < 0:
-                msg = 'received signal {0}'.format(-process.exitcode)
-            elif process.exitcode > 0:
-                msg = 'returned error code {0}'.format(process.exitcode)
-            else:
-                msg = 'exited successfully'
-
-            logging.debug('Worker process %s %s', process.pid, msg)
-            self.processes.remove(process)
-
-        # spawn a thread to collect the worker process once it dies
-        # preventing it from hanging around as zombie
-        reactor.callInThread(threaded_wait)
-
-        def threaded_reader(prefix, fd):
-            with os.fdopen(fd) as handle:
-                for line in handle:
-                    logging.debug('Worker process %s said on %s: %s',
-                                  process.pid, prefix, line.rstrip())
-
-        # spawn two threads that read from the stdout and stderr pipes
-        # and write anything that appears there to the log
-        reactor.callInThread(threaded_reader, 'stdout', stdout[0])
-        os.close(stdout[1])
-        reactor.callInThread(threaded_reader, 'stderr', stderr[0])
-        os.close(stderr[1])
-
-        # closing the sending end in this (receiving) process guarantees
-        # that here the apropriate EOFError is raised upon .recv in the walker
-        sender.close()
-        return receiver, process
-
-    def get_threads(self, querystring, sort='newest_first'):
+    def get_threads(self, querystring, sort='newest_first', exclude_tags=None):
         """
         asynchronously look up thread ids matching `querystring`.
 
@@ -377,6 +263,9 @@ class DBManager(object):
         :param sort: Sort order. one of ['oldest_first', 'newest_first',
                      'message_id', 'unsorted']
         :type query: str
+        :param exclude_tags: Tags to exclude by default unless included in the
+                             search
+        :type exclude_tags: list of str
         :returns: a pipe together with the process that asynchronously
                   writes to it.
         :rtype: (:class:`multiprocessing.Pipe`,
@@ -385,7 +274,11 @@ class DBManager(object):
         assert sort in self._sort_orders
         q = self.query(querystring)
         q.set_sort(self._sort_orders[sort])
-        return self.async(q.search_threads, (lambda a: a.get_thread_id()))
+        if exclude_tags:
+            for tag in exclude_tags:
+                q.exclude_tag(tag)
+        for t in q.search_threads():
+            yield t.get_thread_id()
 
     def query(self, querystring):
         """
@@ -397,7 +290,11 @@ class DBManager(object):
         """
         mode = Database.MODE.READ_ONLY
         db = Database(path=self.path, mode=mode)
-        return db.create_query(querystring)
+        q = db.create_query(querystring)
+        # add configured exclude tags
+        for tag in settings.get('exclude_tags'):
+            q.exclude_tag(tag)
+        return q
 
     def add_message(self, path, tags=None, afterwards=None):
         """
@@ -435,3 +332,36 @@ class DBManager(object):
             raise DatabaseROError()
         path = message.get_filename()
         self.writequeue.append(('remove', afterwards, path))
+
+    def save_named_query(self, alias, querystring, afterwards=None):
+        """
+        add an alias for a query string.
+
+        These are stored in the notmuch database and can be used as part of
+        more complex queries using the syntax "query:alias".
+        See :manpage:`notmuch-search-terms(7)` for more info.
+
+        :param alias: name of shortcut
+        :type alias: str
+        :param querystring: value, i.e., the full query string
+        :type querystring: str
+        :param afterwards: callback to trigger after adding the alias
+        :type afterwards: callable or None
+        """
+        if self.ro:
+            raise DatabaseROError()
+        self.writequeue.append(('setconfig', afterwards, 'query.' + alias,
+                                querystring))
+
+    def remove_named_query(self, alias, afterwards=None):
+        """
+        remove a named query from the notmuch database.
+
+        :param alias: name of shortcut
+        :type alias: str
+        :param afterwards: callback to trigger after adding the alias
+        :type afterwards: callable or None
+        """
+        if self.ro:
+            raise DatabaseROError()
+        self.writequeue.append(('setconfig', afterwards, 'query.' + alias, ''))

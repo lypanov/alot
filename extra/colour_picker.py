@@ -1,8 +1,9 @@
 #!/usr/bin/python
 #
 # COLOUR PICKER.
-# This is a lightly modified version of urwids palette_test.py example script as
-# found at https://raw.github.com/wardi/urwid/master/examples/palette_test.py
+# This is a lightly modified version of urwids palette_test.py example
+# script as found at
+# https://raw.github.com/wardi/urwid/master/examples/palette_test.py
 #
 # This version simply omits resetting the screens default colour palette,
 # and therefore displays the colour attributes as alot would render them in
@@ -31,10 +32,7 @@
 Palette test.  Shows the available foreground and background settings
 in monochrome, 16 color, 88 color and 256 color modes.
 """
-from __future__ import absolute_import
-
 import re
-import sys
 
 import urwid
 import urwid.raw_display
@@ -93,8 +91,9 @@ black_______    dark_gray___    light_gray__    white_______
 """
 
 ATTR_RE = re.compile("(?P<whitespace>[ \n]*)(?P<entry>[^ \n]+)")
-SHORT_ATTR = 4 # length of short high-colour descriptions which may
+SHORT_ATTR = 4  # length of short high-colour descriptions which may
 # be packed one after the next
+
 
 def parse_chart(chart, convert):
     """
@@ -116,7 +115,7 @@ def parse_chart(chart, convert):
             if attrtext:
                 elen = SHORT_ATTR
                 entry = entry[SHORT_ATTR:].strip()
-            else: # try the whole thing
+            else:  # try the whole thing
                 attrtext = convert(entry.strip())
                 assert attrtext, "Invalid palette entry: %r" % entry
                 elen = len(entry)
@@ -124,6 +123,7 @@ def parse_chart(chart, convert):
             attr, text = attrtext
             out.append((attr, text.ljust(elen)))
     return out
+
 
 def foreground_chart(chart, background, colors):
     """
@@ -140,6 +140,7 @@ def foreground_chart(chart, background, colors):
             return None
         return attr, entry
     return parse_chart(chart, convert_foreground)
+
 
 def background_chart(chart, foreground, colors):
     """
@@ -159,9 +160,9 @@ def background_chart(chart, foreground, colors):
             return None
         # fix 8 <= colour < 16
         if colors > 16 and attr.background_basic and \
-            attr.background_number >= 8:
+                attr.background_number >= 8:
             # use high-colour with same number
-            entry = 'h%d'%attr.background_number
+            entry = 'h%d' % attr.background_number
             attr = urwid.AttrSpec(foreground, entry, colors)
         return attr, entry
     return parse_chart(chart, convert_background)
@@ -228,33 +229,32 @@ def main():
                 mode_rb("Monochrome", 1),
                 mode_rb("16-Color", 16, True),
                 mode_rb("88-Color", 88),
-                mode_rb("256-Color", 256),]),
+                mode_rb("256-Color", 256)]),
             urwid.Pile([
                 fcs(urwid.RadioButton(chart_radio_buttons,
-                    "Foreground Colors", True, on_chart_change)),
+                                      "Foreground Colors", True, on_chart_change)),
                 fcs(urwid.RadioButton(chart_radio_buttons,
-                    "Background Colors")),
+                                      "Background Colors")),
                 urwid.Divider(),
                 fcs(urwid.Button("Exit", click_exit)),
                 ]),
-            ]),'panel')
+            ]), 'panel')
         ])
 
     chart_offset = len(lb)
     lb.extend([
-        urwid.Divider() # placeholder for the chart
+        urwid.Divider()  # placeholder for the chart
         ])
 
-    set_mode(16, True) # displays the chart
+    set_mode(16, True)  # displays the chart
 
     def unhandled_input(key):
-        if key in ('Q','q','esc'):
+        if key in ('Q', 'q', 'esc'):
             raise urwid.ExitMainLoop()
 
     urwid.MainLoop(urwid.ListBox(lb), screen=screen,
-        unhandled_input=unhandled_input).run()
+                   unhandled_input=unhandled_input).run()
+
 
 if __name__ == "__main__":
     main()
-
-

@@ -1,14 +1,15 @@
 # Copyright (C) 2011-2012  Patrick Totzke <patricktotzke@gmail.com>
+# Copyright © 2018 Dylan Baker
 # This file is released under the GNU GPL, version 3 or a later revision.
 # For further details see the COPYING file
-from __future__ import absolute_import
-
 import argparse
 import logging
 
 from . import Command, registerCommand
 from .globals import PromptCommand
 from .globals import MoveCommand
+from .globals import SaveQueryCommand as GlobalSaveQueryCommand
+from .common import RetagPromptCommand
 from .. import commands
 
 from .. import buffers
@@ -37,9 +38,9 @@ class OpenThreadCommand(Command):
             query = ui.current_buffer.querystring
             logging.info('open thread view for %s', self.thread)
 
-            sb = buffers.ThreadBuffer(ui, self.thread)
-            ui.buffer_open(sb)
-            sb.unfold_matching(query)
+            tb = buffers.ThreadBuffer(ui, self.thread)
+            ui.buffer_open(tb)
+            tb.unfold_matching(query)
 
 
 @registerCommand(MODE, 'refine', help='refine query', arguments=[
@@ -87,29 +88,13 @@ class RefinePromptCommand(Command):
     """prompt to change this buffers querystring"""
     repeatable = True
 
-    def apply(self, ui):
+    async def apply(self, ui):
         sbuffer = ui.current_buffer
         oldquery = sbuffer.querystring
-        return ui.apply_command(PromptCommand('refine ' + oldquery))
+        return await ui.apply_command(PromptCommand('refine ' + oldquery))
 
 
-@registerCommand(MODE, 'retagprompt')
-class RetagPromptCommand(Command):
-
-    """prompt to retag selected threads\' tags"""
-    def apply(self, ui):
-        thread = ui.current_buffer.get_selected_thread()
-        if not thread:
-            return
-        tags = []
-        for tag in thread.get_tags():
-            if ' ' in tag:
-                tags.append('"%s"' % tag)
-            # skip empty tags
-            elif tag:
-                tags.append(tag)
-        initial_tagstring = ','.join(sorted(tags)) + ','
-        return ui.apply_command(PromptCommand('retag ' + initial_tagstring))
+RetagPromptCommand = registerCommand(MODE, 'retagprompt')(RetagPromptCommand)
 
 
 @registerCommand(
@@ -118,10 +103,11 @@ class RetagPromptCommand(Command):
         (['--no-flush'], {'action': 'store_false', 'dest': 'flush',
                           'default': 'True',
                           'help': 'postpone a writeout to the index'}),
-        (['--all'], {'action': 'store_true', 'dest': 'allmessages', 'default':
-                     False, 'help': 'retag all messages in search result'}),
+        (['--all'], {'action': 'store_true', 'dest': 'allmessages',
+            'default': False,
+            'help': 'tag all messages that match the current search query'}),
         (['tags'], {'help': 'comma separated list of tags'})],
-    help='add tags to all messages in the thread that match the current query',
+    help='add tags to all messages in the selected thread',
 )
 @registerCommand(
     MODE, 'retag', forced={'action': 'set'},
@@ -129,10 +115,11 @@ class RetagPromptCommand(Command):
         (['--no-flush'], {'action': 'store_false', 'dest': 'flush',
                           'default': 'True',
                           'help': 'postpone a writeout to the index'}),
-        (['--all'], {'action': 'store_true', 'dest': 'allmessages', 'default':
-                     False, 'help': 'retag all messages in search result'}),
+        (['--all'], {'action': 'store_true', 'dest': 'allmessages',
+            'default': False,
+            'help': 'retag all messages that match the current query'}),
         (['tags'], {'help': 'comma separated list of tags'})],
-    help='set tags of all messages in the thread that match the current query',
+    help='set tags to all messages in the selected thread',
 )
 @registerCommand(
     MODE, 'untag', forced={'action': 'remove'},
@@ -140,10 +127,11 @@ class RetagPromptCommand(Command):
         (['--no-flush'], {'action': 'store_false', 'dest': 'flush',
                           'default': 'True',
                           'help': 'postpone a writeout to the index'}),
-        (['--all'], {'action': 'store_true', 'dest': 'allmessages', 'default':
-                     False, 'help': 'retag all messages in search result'}),
+        (['--all'], {'action': 'store_true', 'dest': 'allmessages',
+            'default': False,
+            'help': 'untag all messages that match the current query'}),
         (['tags'], {'help': 'comma separated list of tags'})],
-    help='remove tags from all messages in the thread that match the query',
+    help='remove tags from all messages in the selected thread',
 )
 @registerCommand(
     MODE, 'toggletags', forced={'action': 'toggle'},
@@ -152,16 +140,15 @@ class RetagPromptCommand(Command):
                           'default': 'True',
                           'help': 'postpone a writeout to the index'}),
         (['tags'], {'help': 'comma separated list of tags'})],
-    help='flip presence of tags on this thread. A tag is considered present '
-         'if at least one message contained in this thread is tagged with it. '
-         'In that case this command will remove the tag from every message in '
-         'the thread.')
+    help='flip presence of tags on the selected thread: a tag is considered present '
+         'and will be removed if at least one message in this thread is '
+         'tagged with it')
 class TagCommand(Command):
 
     """manipulate message tags"""
     repeatable = True
 
-    def __init__(self, tags=u'', action='add', allmessages=False, flush=True,
+    def __init__(self, tags='', action='add', allmessages=False, flush=True,
                  **kwargs):
         """
         :param tags: comma separated list of tagstrings to set
@@ -170,9 +157,9 @@ class TagCommand(Command):
                        and removes all other if 'set' or toggle individually if
                        'toggle'
         :type action: str
-        :param all: tag all messages in search result
-        :type all: bool
-        :param flush: imediately write out to the index
+        :param allmessages: tag all messages in search result
+        :type allmessages: bool
+        :param flush: immediately write out to the index
         :type flush: bool
         """
         self.tagsstring = tags
@@ -181,7 +168,7 @@ class TagCommand(Command):
         self.flush = flush
         Command.__init__(self, **kwargs)
 
-    def apply(self, ui):
+    async def apply(self, ui):
         searchbuffer = ui.current_buffer
         threadline_widget = searchbuffer.get_selected_threadline()
         # pass if the current buffer has no selected threadline
@@ -197,14 +184,6 @@ class TagCommand(Command):
         logging.debug('all? %s', self.allm)
         logging.debug('q: %s', testquery)
 
-        hitcount_before = ui.dbman.count_messages(testquery)
-
-        def remove_thread():
-            logging.debug('remove thread from result list: %s', thread)
-            if threadline_widget in searchbuffer.threadlist:
-                # remove this thread from result list
-                searchbuffer.threadlist.remove(threadline_widget)
-
         def refresh():
             # remove thread from resultset if it doesn't match the search query
             # any more and refresh selected threadline otherwise
@@ -212,13 +191,17 @@ class TagCommand(Command):
             # update total result count
             if not self.allm:
                 if hitcount_after == 0:
-                    remove_thread()
+                    logging.debug('remove thread from result list: %s', thread)
+                    if threadline_widget in searchbuffer.threadlist:
+                        # remove this thread from result list
+                        searchbuffer.threadlist.remove(threadline_widget)
                 else:
                     threadline_widget.rebuild()
+                searchbuffer.result_count = searchbuffer.dbman.count_messages(
+                    searchbuffer.querystring)
             else:
                 searchbuffer.rebuild()
 
-            searchbuffer.result_count += (hitcount_after - hitcount_before)
             ui.update()
 
         tags = [x for x in self.tagsstring.split(',') if x]
@@ -247,7 +230,8 @@ class TagCommand(Command):
 
         # flush index
         if self.flush:
-            ui.apply_command(commands.globals.FlushCommand(callback=refresh))
+            await ui.apply_command(
+                commands.globals.FlushCommand(callback=refresh))
 
 
 @registerCommand(
@@ -262,3 +246,24 @@ class MoveFocusCommand(MoveCommand):
             ui.update()
         else:
             MoveCommand.apply(self, ui)
+
+
+@registerCommand(
+    MODE, 'savequery',
+    arguments=[
+        (['--no-flush'], {'action': 'store_false', 'dest': 'flush',
+                          'default': 'True',
+                          'help': 'postpone a writeout to the index'}),
+        (['alias'], {'help': 'alias to use for query string'}),
+        (['query'], {'help': 'query string to store',
+                     'nargs': argparse.REMAINDER,
+                     }),
+    ],
+    help='store query string as a "named query" in the database. '
+         'This falls back to the current search query in search buffers.')
+class SaveQueryCommand(GlobalSaveQueryCommand):
+    def apply(self, ui):
+        searchbuffer = ui.current_buffer
+        if not self.query:
+            self.query = searchbuffer.querystring
+        GlobalSaveQueryCommand.apply(self, ui)

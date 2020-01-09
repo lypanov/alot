@@ -1,19 +1,17 @@
 # Copyright (C) 2011-2012  Patrick Totzke <patricktotzke@gmail.com>
 # This file is released under the GNU GPL, version 3 or a later revision.
 # For further details see the COPYING file
-from __future__ import absolute_import
-
 import argparse
 import glob
 import logging
 import os
 import re
 
-from ..settings import settings
+from ..settings.const import settings
 from ..helper import split_commandstring, string_decode
 
 
-class Command(object):
+class Command:
 
     """base class for commands"""
     repeatable = False
@@ -24,7 +22,7 @@ class Command(object):
         self.undoable = False
         self.help = self.__doc__
 
-    def apply(self, caller):
+    def apply(self, ui):
         """code that gets executed when this command is applied"""
         pass
 
@@ -34,11 +32,13 @@ class CommandCanceled(Exception):
     """
     pass
 
+
 COMMANDS = {
     'search': {},
     'envelope': {},
     'bufferlist': {},
     'taglist': {},
+    'namedqueries': {},
     'thread': {},
     'global': {},
 }
@@ -90,8 +90,7 @@ class CommandArgumentParser(argparse.ArgumentParser):
         raise CommandParseError(message)
 
 
-class registerCommand(object):
-
+class registerCommand:
     """
     Decorator used to register a :class:`Command` as
     handler for command `name` in `mode` so that it
@@ -100,6 +99,8 @@ class registerCommand(object):
     Consider this example that shows how a :class:`Command` class
     definition is decorated to register it as handler for
     'save' in mode 'thread' and add boolean and string arguments::
+
+    .. code-block::
 
         @registerCommand('thread', 'save', arguments=[
             (['--all'], {'action': 'store_true', 'help':'save all'}),
@@ -165,7 +166,7 @@ def commandfactory(cmdline, mode='global'):
     try:
         args = split_commandstring(cmdline)
     except ValueError as e:
-        raise CommandParseError(e.message)
+        raise CommandParseError(str(e))
     args = [string_decode(x, 'utf-8') for x in args]
     logging.debug('ARGS: %s', args)
     cmdname = args[0]

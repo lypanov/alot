@@ -5,7 +5,8 @@ Hooks
 Hooks are python callables that live in a module specified by `hooksfile` in
 the config. Per default this points to :file:`~/.config/alot/hooks.py`.
 
-.. rubric:: Pre/Post Command Hooks
+Pre/Post Command Hooks
+----------------------
 
 For every :ref:`COMMAND <usage.commands>` in mode :ref:`MODE <modes>`, the
 callables :func:`pre_MODE_COMMAND` and :func:`post_MODE_COMMAND` -- if defined
@@ -28,7 +29,7 @@ Consider this pre-hook for the exit command, that logs a personalized goodbye
 message::
 
     import logging
-    from alot.settings import settings
+    from alot.settings.const import settings
     def pre_global_exit(**kwargs):
         accounts = settings.get_accounts()
         if accounts:
@@ -36,11 +37,12 @@ message::
         else:
             logging.info('goodbye!')
 
-.. rubric:: Other Hooks
+Other Hooks
+-----------
 
 Apart from command pre- and posthooks, the following hooks will be interpreted:
 
-.. py:function:: reply_prefix(realname, address, timestamp[, ui= None, dbm=None])
+.. py:function:: reply_prefix(realname, address, timestamp[, message=None, ui= None, dbm=None])
 
     Is used to reformat the first indented line in a reply message.
     This defaults to 'Quoting %s (%s)\n' % (realname, timestamp)' unless this
@@ -52,9 +54,11 @@ Apart from command pre- and posthooks, the following hooks will be interpreted:
     :type address: str
     :param timestamp: value of the Date header of the replied message
     :type timestamp: :obj:`datetime.datetime`
+    :param message: message object attached to reply
+    :type message: :obj:`email.Message`
     :rtype: string
 
-.. py:function:: forward_prefix(realname, address, timestamp[, ui= None, dbm=None])
+.. py:function:: forward_prefix(realname, address, timestamp[, message=None, ui= None, dbm=None])
 
     Is used to reformat the first indented line in a inline forwarded message.
     This defaults to 'Forwarded message from %s (%s)\n' % (realname,
@@ -66,6 +70,8 @@ Apart from command pre- and posthooks, the following hooks will be interpreted:
     :type address: str
     :param timestamp: value of the Date header of the replied message
     :type timestamp: :obj:`datetime.datetime`
+    :param message: message object being forwarded
+    :type message: :obj:`email.Message`
     :rtype: string
 
 .. _pre-edit-translate:
