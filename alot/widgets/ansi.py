@@ -1,8 +1,10 @@
+
 # Copyright (C) 2011-2017  Patrick Totzke <patricktotzke@gmail.com>
 # This file is released under the GNU GPL, version 3 or a later revision.
 # For further details see the COPYING file
 
 import urwid
+import re
 
 
 class ANSIText(urwid.WidgetWrap):
@@ -58,7 +60,9 @@ def parse_escapes_to_urwid(text, default_attr=None, default_attr_focus=None,
     maps all attributes applied here to focused attribute.
     """
 
-    text = text.split("\033[")
+    text = text.split("\033")
+    f = open("/tmp/out", "a")
+    f.write(repr(text))
     urwid_text = [text[0]]
     urwid_focus = {None: default_attr_focus}
 
@@ -66,34 +70,50 @@ def parse_escapes_to_urwid(text, default_attr=None, default_attr_focus=None,
     # changed by another escape.
     attr = dict(fg=default_attr._foreground_color, bg=default_attr.background,
                 bold=default_attr.bold, underline=default_attr.underline,
-                standout=default_attr.underline)
+                standout=default_attr.underline,
+                url=None)
+    osc_tmp = None
     for part in text[1:]:
-        esc_code, esc_substr = part.split('m', 1)
-        esc_code = esc_code.split(';')
+        f.write("whee");
 
-        if not esc_code:
-            attr.update(fg=default_attr._foreground_color,
-                        bg=default_attr.background, bold=default_attr.bold,
-                        underline=default_attr.underline,
-                        standout=default_attr.underline)
-        else:
-            i = 0
-            while i < len(esc_code):
-                code = esc_code[i]
-                if code is 0:
-                    attr.update({'bold': default_attr.bold,
-                                 'underline': default_attr.underline,
-                                 'standout': default_attr.standout})
-                if code in ECODES:
-                    attr.update(ECODES[code])
-                # 256 codes
-                elif code == '38':
-                    attr.update(fg='h' + esc_code[i+2])
-                    i += 2
-                elif code == '48':
-                    attr.update(bg='h'+esc_code[i+2])
-                    i += 2
-                i += 1
+        esc_substr = None
+
+        if part[0] == "[":
+            esc_code, esc_substr = part[1:].split('m', 1)
+            f.write("parsing color ( " + esc_code + " )\n");
+            esc_code = esc_code.split(';')
+
+            if not esc_code:
+                attr.update(fg=default_attr._foreground_color,
+                            bg=default_attr.background, bold=default_attr.bold,
+                            underline=default_attr.underline,
+                            standout=default_attr.underline,
+                            url=None)
+            else:
+                i = 0
+                while i < len(esc_code):
+                    code = esc_code[i]
+                    if code is 0:
+                        attr.update({'bold': default_attr.bold,
+                                    'underline': default_attr.underline,
+                                    'standout': default_attr.standout})
+                    if code in ECODES:
+                        attr.update(ECODES[code])
+                    # 256 codes
+                    elif code == '38':
+                        attr.update(fg='h' + esc_code[i+2])
+                        i += 2
+                    elif code == '48':
+                        attr.update(bg='h'+esc_code[i+2])
+                        i += 2
+                    i += 1
+        elif part[:4] == "]8;;":
+            f.write("\ncmd: " + part[4:] + "\n")
+            attr.update(url=part[4:])
+
+        elif part[0] == "\\":
+            f.write("\ngot a backslash. end of command\n")
+            esc_substr = part[1:]
 
         # If there is no string in esc_substr we skip it, the above
         # attributes will accumulate to the next escapes.
@@ -107,9 +127,16 @@ def parse_escapes_to_urwid(text, default_attr=None, default_attr_focus=None,
                 urwid_fg += ',underline'
             if attr['standout']:
                 urwid_fg += ',standout'
+            if attr['url']:
+                # remove any spaces (illegal inside url) and encode commas as spaces
+                #   - urwid_fg uses commas as the seperator
+                encoded_url = attr['url'].replace(" ", "").replace(",", " ")
+                urwid_fg += ',url|' + encoded_url
             if parse_background:
                 urwid_bg = attr['bg']
+            # f.write("text: " + esc_substr + ", fg:" + urwid_fg)
             urwid_attr = urwid.AttrSpec(urwid_fg, urwid_bg)
             urwid_focus[urwid_attr] = default_attr_focus
             urwid_text.append((urwid_attr, esc_substr))
+    f.write(str(urwid_text))
     return urwid_text, urwid_focus
