@@ -2,9 +2,9 @@
 # Copyright © 2017-2018 Dylan Baker <dylan@pnwbakers.com>
 # This file is released under the GNU GPL, version 3 or a later revision.
 # For further details see the COPYING file
-import gpg
 
-from .errors import GPGProblem, GPGCode
+# import gpg
+# from .errors import GPGProblem, GPGCode
 
 
 def RFC3156_micalg_from_algo(hash_algo):

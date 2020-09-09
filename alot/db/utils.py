@@ -18,7 +18,7 @@ import quopri
 
 from .. import crypto
 from .. import helper
-from ..errors import GPGProblem
+# from ..errors import GPGProblem
 from ..settings.const import settings
 from ..helper import string_sanitize
 from ..helper import string_decode

@@ -12,14 +12,14 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 import email.charset as charset
-import gpg
+# import gpg
 
 from .attachment import Attachment
 from .. import __version__
 from .. import helper
 from .. import crypto
 from ..settings.const import settings
-from ..errors import GPGProblem, GPGCode
+# from ..errors import GPGProblem, GPGCode
 
 charset.add_charset('utf-8', charset.QP, charset.QP, 'utf-8')
 

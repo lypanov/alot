@@ -4,7 +4,7 @@
 import re
 import logging
 
-from ..errors import GPGProblem, GPGCode
+# from ..errors import GPGProblem, GPGCode
 from ..settings.const import settings
 from ..settings.errors import NoMatchingAccount
 from .. import crypto

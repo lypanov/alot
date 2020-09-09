@@ -22,7 +22,7 @@ from .. import commands
 from .. import crypto
 from ..account import SendingMailFailed, StoreMailError
 from ..db.errors import DatabaseError
-from ..errors import GPGProblem
+# from ..errors import GPGProblem
 from ..helper import string_decode
 from ..settings.const import settings
 from ..settings.errors import NoMatchingAccount

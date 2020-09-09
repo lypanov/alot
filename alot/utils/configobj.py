@@ -11,7 +11,7 @@ from validate import ValidateError, VdtValueTooLongError, VdtValueError
 from urwid import AttrSpec, AttrSpecError
 
 from .. import crypto
-from ..errors import GPGProblem
+# from ..errors import GPGProblem
 
 
 def attr_triple(value):
