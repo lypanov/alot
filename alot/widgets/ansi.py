@@ -1,11 +1,9 @@
-
 # Copyright (C) 2011-2017  Patrick Totzke <patricktotzke@gmail.com>
 # This file is released under the GNU GPL, version 3 or a later revision.
 # For further details see the COPYING file
 
 import urwid
 import re
-
 
 class ANSIText(urwid.WidgetWrap):
 
@@ -61,8 +59,8 @@ def parse_escapes_to_urwid(text, default_attr=None, default_attr_focus=None,
     """
 
     text = text.split("\033")
-    f = open("/tmp/out", "a")
-    f.write(repr(text))
+    f = open("/tmp/out2", "a")
+    f.write("wheeeeee")
     urwid_text = [text[0]]
     urwid_focus = {None: default_attr_focus}
 
@@ -74,13 +72,13 @@ def parse_escapes_to_urwid(text, default_attr=None, default_attr_focus=None,
                 url=None)
     osc_tmp = None
     for part in text[1:]:
-        f.write("whee");
+        # f.write("whee");
 
         esc_substr = None
 
         if part[0] == "[":
             esc_code, esc_substr = part[1:].split('m', 1)
-            f.write("parsing color ( " + esc_code + " )\n");
+            # f.write("parsing color ( " + esc_code + " )\n");
             esc_code = esc_code.split(';')
 
             if not esc_code:
@@ -108,11 +106,11 @@ def parse_escapes_to_urwid(text, default_attr=None, default_attr_focus=None,
                         i += 2
                     i += 1
         elif part[:4] == "]8;;":
-            f.write("\ncmd: " + part[4:] + "\n")
+            # f.write("\ncmd: " + part[4:] + "\n")
             attr.update(url=part[4:])
 
         elif part[0] == "\\":
-            f.write("\ngot a backslash. end of command\n")
+            # f.write("\ngot a backslash. end of command\n")
             esc_substr = part[1:]
 
         # If there is no string in esc_substr we skip it, the above
@@ -138,5 +136,5 @@ def parse_escapes_to_urwid(text, default_attr=None, default_attr_focus=None,
             urwid_attr = urwid.AttrSpec(urwid_fg, urwid_bg)
             urwid_focus[urwid_attr] = default_attr_focus
             urwid_text.append((urwid_attr, esc_substr))
-    f.write(str(urwid_text))
+    # f.write(str(urwid_text))
     return urwid_text, urwid_focus
