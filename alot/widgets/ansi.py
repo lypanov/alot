@@ -59,8 +59,8 @@ def parse_escapes_to_urwid(text, default_attr=None, default_attr_focus=None,
     """
 
     text = text.split("\033")
-    f = open("/tmp/out2", "a")
-    f.write("wheeeeee")
+    # f = open("/tmp/out2", "a")
+    # f.write("wheeeeee")
     urwid_text = [text[0]]
     urwid_focus = {None: default_attr_focus}
 
